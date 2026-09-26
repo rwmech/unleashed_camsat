@@ -1,0 +1,10 @@
+.pio/
+.vscode/
+firmware/core/
+firmware/.core-cache/
+firmware/sdkconfig.*
+!firmware/sdkconfig.defaults
+firmware/managed_components/
+firmware/dependencies.lock
+*.pyc
+__pycache__/

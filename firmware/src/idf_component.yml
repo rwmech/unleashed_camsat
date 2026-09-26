@@ -1,0 +1,7 @@
+# µnleashed camsat: component dependencies (fetched at build).
+# Copyright 2026 - Robert Mech. SPDX-License-Identifier: GPL-3.0-or-later
+dependencies:
+  idf: ">=5.1"
+  # Espressif's camera driver (Apache-2.0), the version the core uses.
+  espressif/esp32-camera:
+    version: "2.1.7"

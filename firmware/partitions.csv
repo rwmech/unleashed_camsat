@@ -1,0 +1,6 @@
+# µnleashed camsat: the satellite's flash. One app and its settings; there
+# is nothing else to keep. Copyright 2026 - Robert Mech, GPL-3.0-or-later.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x6000
+phy_init, data, phy,     0xf000,   0x1000
+factory,  app,  factory, 0x10000,  0x3F0000

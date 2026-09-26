@@ -1,0 +1,13 @@
+; The µnleashed core the satellite builds its link and picture code from.
+; firmware/tools/fetch_core.py copies the files below out of the core at
+; exactly this commit into firmware/core/, so the satellite and the board
+; speak the same link without a second copy of it in this repository.
+;
+; source: the core repository, a git URL or a local path (relative to this
+;         file). A local path is for development; a release uses the URL.
+; commit: the full 40-character commit.
+;
+; Copyright 2026 - Robert Mech
+; SPDX-License-Identifier: GPL-3.0-or-later
+source = ../esp32-bbs-c1/esp32-bbs
+commit = c948de34c411f2a74f32afdfdbc51cd4ada5f504
