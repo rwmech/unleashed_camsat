@@ -76,8 +76,6 @@ From then on the satellite finds its board by itself after every power cut, and 
 
 ## On the board
 
-| Command | Who | What |
-|---|---|---|
 Each paired satellite is a camera in the board's own camera list, under the name LINK gives it (`LINK NAME` changes it). The board's commands work the same whether a camera is built in or a satellite:
 
 | Command | Who | What |
