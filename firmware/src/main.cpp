@@ -498,6 +498,21 @@ void linkTask(void*) {
                 const uint8_t* b = g_job.pic.buf + cam::kHead;
                 ESP_LOGI(TAG, "selftest: %02x %02x %02x %02x len %u: %.60s", b[0], b[1], b[2], b[3],
                          static_cast<unsigned>(b[4] << 8 | b[5]), b + 6);
+                // The picture itself, in base64 between markers, for the bench to look at.
+                static const char k64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                printf("-----BEGIN JPEG-----\n");
+                char line[77];
+                size_t at = 0;
+                for (size_t i = 0; i < g_job.pic.len; i += 3) {
+                    const uint32_t v = b[i] << 16 | (i + 1 < g_job.pic.len ? b[i + 1] << 8 : 0) |
+                                       (i + 2 < g_job.pic.len ? b[i + 2] : 0);
+                    line[at++] = k64[v >> 18 & 63];
+                    line[at++] = k64[v >> 12 & 63];
+                    line[at++] = i + 1 < g_job.pic.len ? k64[v >> 6 & 63] : '=';
+                    line[at++] = i + 2 < g_job.pic.len ? k64[v & 63] : '=';
+                    if (at == 76 || i + 3 >= g_job.pic.len) { line[at] = '\0'; printf("%s\n", line); at = 0; }
+                }
+                printf("-----END JPEG-----\n");
             }
             g_job.ph.store(P_IDLE);
             g_led = Led::Pairing;
@@ -600,7 +615,12 @@ extern "C" void app_main(void) {
     // correction and the watermark without a board.
     vTaskDelay(pdMS_TO_TICKS(1500));
     g_job.r = SnapReq();
+#ifdef CAMSAT_SELFTEST_RAW
+    g_job.r.mark = false;
+    g_set.pic.levels = false;
+#else
     g_job.r.mark = true;
+#endif
     snprintf(g_job.r.board, sizeof(g_job.r.board), "\xC2\xB5nleashed Bench");
     snprintf(g_job.r.when, sizeof(g_job.r.when), "2026-09-26 12:00");
     snprintf(g_job.r.who, sizeof(g_job.r.who), "selftest");
