@@ -1,0 +1,4 @@
+# Text is stored with LF whatever the checkout machine does.
+* text=auto eol=lf
+*.jpg binary
+*.bin binary
