@@ -253,6 +253,7 @@ bool sendEvent(uint8_t kind) {
     ESP_LOGI(TAG, "asked the board for a %s picture", kind == CEV_MOTION ? "motion" : "timelapse");
     g_eventSess = sess;
     g_eventAt = ms();
+    g_quietSince = g_eventAt;
     return true;
 }
 
@@ -496,10 +497,16 @@ void sleepWatch(uint32_t now) {
     if (!tl && !motion) return;                          // nothing would wake it
     const bool cold = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED;
     if (cold && now - g_bootMs < 60000) return;
-    const uint32_t quietFor = g_wakeKind && !g_wakeSent ? 10000u : 2000u;
-    if (now - g_quietSince < quietFor) return;
-    if (g_wakeKind && !g_wakeSent && now - g_bootMs < 15000) return;   // still finding the board
-    ESP_LOGI(TAG, "sleeping%s%s", tl ? ", timer" : "", motion ? ", motion" : "");
+    // Awake while the board still owes an answer to the EVENT (its SNAP, or
+    // the 10 s after which the EVENT is let go), while the wake's EVENT has
+    // not gone yet (15 s to find the board), and for 2 s after the last thing
+    // that happened, so a picture's last acknowledgements get out.
+    if (g_eventSess) return;
+    if (g_wakeKind && !g_wakeSent && now - g_bootMs < 15000) return;
+    const uint32_t t = ms();                             // not the pass's now: g_quietSince may be newer
+    if (static_cast<int32_t>(t - g_quietSince) < 2000) return;
+    ESP_LOGI(TAG, "sleeping%s%s, awake %u ms", tl ? ", timer" : "", motion ? ", motion" : "",
+             static_cast<unsigned>(t - g_bootMs));
     if (tl) esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(tl) * 1000000ull);
     if (motion) {
         // The PIR's line held low while asleep, so an unplugged sensor cannot
@@ -586,7 +593,9 @@ void linkTask(void*) {
             g_led = Led::Off;
             ESP_LOGW(TAG, "no board answered in 5 minutes; reset the satellite to pair again");
         }
-        if (g_eventSess && now - g_eventAt > 10000) {    // the board let the EVENT go
+        // Signed: sendEvent, earlier in this pass, stamps g_eventAt after this
+        // pass's now was read (the same wrap the board's timeout had).
+        if (g_eventSess && static_cast<int32_t>(now - g_eventAt) > 10000) {    // the board let the EVENT go
             g_eng->closeSession(0, g_eventSess);
             g_eventSess = 0;
         }
@@ -617,7 +626,13 @@ extern "C" void app_main(void) {
     if (!cam::begin()) ESP_LOGE(TAG, "no PSRAM for the picture buffer");
 
     switch (esp_sleep_get_wakeup_cause()) {
+#ifdef CAMSAT_BENCH_MOTION
+        // The bench, with no PIR wired: a timer wake stands in for a motion
+        // wake, so the board's side of a motion picture after sleep is tested.
+        case ESP_SLEEP_WAKEUP_TIMER: g_wakeKind = CEV_MOTION; break;
+#else
         case ESP_SLEEP_WAKEUP_TIMER: g_wakeKind = CEV_TIMELAPSE; break;
+#endif
         case ESP_SLEEP_WAKEUP_EXT0:  g_wakeKind = CEV_MOTION; g_motionWas = true; break;
         default: break;
     }
