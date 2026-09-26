@@ -463,15 +463,8 @@ void finish(bool ok) {
     snprintf(buf, sizeof(buf), "Photo saved: %.111s (FILES, area 12)", j.rel);
     say(*s, Color::LightGreen, buf);
     s->term.nl(s->tl);
-#ifdef BBS_HAS_CAMERA
-    // files::sendPhoto is a camera board's until the core's 1.1.2 merge makes
-    // Photos any provider's; until then a board with only a satellite says
-    // where the picture is kept.
     const uint8_t fi = plugins::indexOf("files");
     const bool filesOn = fi != 0xFF && plugins::running(fi);
-#else
-    const bool filesOn = false;
-#endif
     const camrules::Offer o = camrules::offerFor(true, true, filesOn && plugins::mayUse(*s, g_set.photos),
                                                  claims::held(claims::Res::Transfer));
     if (o == camrules::Offer::Ask && g_offer && s->id < kSlots) {
@@ -726,7 +719,6 @@ void onKey(Session& s, int k, uint32_t now) {
     s.ownerData = 0;
     s.term.cursor(s.tl, true);
     s.term.nl(s.tl);
-#ifdef BBS_HAS_CAMERA
     if (k == 'y' || k == 'Y' || k == 'x' || k == 'X') {
         char rel[112] = "";
         if (g_offer && s.id < kSlots) snprintf(rel, sizeof(rel), "%s", g_offer[s.id].rel);
@@ -734,10 +726,6 @@ void onKey(Session& s, int k, uint32_t now) {
         if (!files::sendPhoto(b, s, rel, k == 'x' || k == 'X', now)) b.prompt(s);
         return;
     }
-#else
-    (void)k;
-    (void)now;
-#endif
     say(s, Color::Grey, "It is kept in the Photos area.");
     b.release(s);
 }
@@ -811,6 +799,8 @@ void satCommand(void* ctx, Bbs& b, Session& s, const char*, uint32_t) {
 // listed: a satellite is in the camera list while it is paired, under the
 // name LINK gives it. Checked a second at a time from tick, so a pairing, a
 // LINK NAME and a LINK FORGET each follow without a hook of their own.
+void photosFollow(bool any);
+
 void reconcile() {
     if (!g_sat) return;
     ulink::Engine* e = linkp::engine();
@@ -831,6 +821,9 @@ void reconcile() {
             if (!x.listed) plat::log("camsat: the board's camera list is full; \"%s\" is not in it", x.name);
         }
     }
+    bool any = false;
+    for (uint8_t p = 0; p < ulink::Engine::kPeers; ++p) any = any || g_sat[p].listed;
+    photosFollow(any);
 }
 
 void unlistAll() {
@@ -903,12 +896,20 @@ void setting(const char* key, char* out, size_t n) {
 // ---------------------------------------------------------------------------
 // start / stop
 // ---------------------------------------------------------------------------
-bool providing() { return g_running; }
+// Photos is offered on a board with no camera of its own only while a
+// satellite is paired to fill it (photos::provide, 1.2.0).
+bool g_provided = false;
+bool providing() { return g_running && g_provided; }
 void photoLevels(PlugLevel& see, PlugLevel& removeLevel) {
     see = g_set.photos;
     removeLevel = g_index != 0xFF ? plugins::levelFor(g_index, 2) : PlugLevel::Sysop;
 }
 const photos::Provider kProvider = { kName, providing, photoLevels };
+
+void photosFollow(bool any) {
+    if (any && !g_provided) g_provided = photos::provide(kProvider);
+    else if (!any && g_provided) { photos::withdraw(kProvider); g_provided = false; }
+}
 
 bool start(Bbs&) {
     g_index = plugins::indexOf(kName);
@@ -931,7 +932,6 @@ bool start(Bbs&) {
         return false;
     }
     if (!g_offer) g_offer = static_cast<Offer*>(calloc(kSlots, sizeof(Offer)));
-    photos::provide(kProvider);
     g_tlPrimed = false;
     g_running = true;
     reconcile();                                           // SNAPSHOT and CAMERA reach them
@@ -949,7 +949,7 @@ void stop() {
     g_running = false;
     unlistAll();
     if (busy()) failWith("the camera was switched off");
-    photos::withdraw(kProvider);
+    photosFollow(false);
     linkp::unregisterFamily(ulink::FAM_CAMERA);
 }
 

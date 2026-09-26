@@ -55,6 +55,8 @@
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp32/rtc.h"
+#include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -145,6 +147,24 @@ bool     g_motionWas = false;
 uint32_t g_forgetFrom = 0;
 uint16_t g_eventSess = 0;                 // an EVENT waiting for the board's SNAP
 uint32_t g_eventAt = 0;
+
+// Across deep sleep, on the RTC clock (esp_timer starts again at each wake,
+// the RTC clock keeps counting through sleep): the last motion EVENT, so the
+// hold-off holds across sleeps and one visitor is not a burst, and when the
+// next timelapse picture is due, so a wake to re-arm the sensor is not taken
+// for one.
+RTC_DATA_ATTR uint64_t r_motionUs = 0;
+RTC_DATA_ATTR bool     r_motionSet = false;
+RTC_DATA_ATTR uint64_t r_tlDueUs = 0;
+
+uint64_t rtcUs() { return esp_rtc_get_time_us(); }
+
+// holdLeftUs: how much of the motion hold-off is still to run, 0 when none.
+uint64_t holdLeftUs() {
+    if (!r_motionSet) return 0;
+    const uint64_t hold = static_cast<uint64_t>(g_set.holdoffS) * 1000000ull, now = rtcUs();
+    return now < r_motionUs + hold ? r_motionUs + hold - now : 0;
+}
 
 uint32_t unixNow() {
     return g_unixAt ? g_unixAt + (ms() - g_unixMs) / 1000 : 0;
@@ -482,14 +502,61 @@ void motionWatch(uint32_t now) {
 #endif
     const bool rise = high && !g_motionWas;
     g_motionWas = high;
-    if (!rise) return;
-    if (g_motionAt && now - g_motionAt < static_cast<uint32_t>(g_set.holdoffS) * 1000u) return;
-    if (sendEvent(CEV_MOTION)) g_motionAt = now;
+    if (!rise || holdLeftUs()) return;
+    if (sendEvent(CEV_MOTION)) {
+        g_motionAt = now;
+        r_motionUs = rtcUs();
+        r_motionSet = true;
+    }
 }
 
 // sleepWatch: with deep sleep on, sleep once nothing is going on: a picture
 // sent, or a wake the board never answered. Awake for the first minute
 // after a power-up, so the board can send settings and a sysop can pair.
+// goSleep: into deep sleep, woken by the timelapse's timer, by the motion
+// sensor, or by a short timer that only re-arms the sensor. The sensor is
+// armed only when its hold-off has run out and its line is low: a PIR
+// holds OUT high for seconds after it fires, and a level wake armed on a
+// high line wakes the chip at once, which is how one visitor becomes a
+// burst of wakes.
+void goSleep() {
+    const uint64_t tl = (static_cast<uint64_t>(g_set.tlMin) * 60u + g_set.tlSec) * 1000000ull;
+    const bool motion = g_set.motion && motionPinOk(g_set.motionPin);
+    const uint64_t now = rtcUs();
+    uint64_t timerUs = 0;
+    if (tl) {
+        if (r_tlDueUs <= now) r_tlDueUs = now + tl;
+        timerUs = r_tlDueUs - now;
+    }
+    bool armed = false;
+    if (motion) {
+        const gpio_num_t g = static_cast<gpio_num_t>(g_set.motionPin);
+        const uint64_t left = holdLeftUs();
+        const bool high = gpio_get_level(g) != 0;
+        if (!left && !high) {
+            // The line held low while asleep, so an unplugged sensor cannot
+            // wake the satellite on noise: the pull lives in the RTC domain,
+            // which stays powered for it.
+            esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+            rtc_gpio_pullup_dis(g);
+            rtc_gpio_pulldown_en(g);
+            esp_sleep_enable_ext0_wakeup(g, 1);
+            armed = true;
+        } else {
+            // Back when the hold-off ends, or in 5 s for a line still high,
+            // only to arm the sensor.
+            const uint64_t rearm = left ? left : 5000000ull;
+            if (!timerUs || rearm < timerUs) timerUs = rearm;
+        }
+    }
+    if (timerUs) esp_sleep_enable_timer_wakeup(timerUs);
+    ESP_LOGI(TAG, "sleeping: timelapse %s, motion %s, timer %u ms",
+             tl ? "on" : "off", armed ? "armed" : (motion ? "held" : "off"),
+             static_cast<unsigned>(timerUs / 1000ull));
+    ledSet(false);
+    esp_deep_sleep_start();
+}
+
 void sleepWatch(uint32_t now) {
     if (!g_set.sleep || !g_paired || g_job.ph.load() != P_IDLE) return;
     const uint32_t tl = static_cast<uint32_t>(g_set.tlMin) * 60u + g_set.tlSec;
@@ -505,21 +572,8 @@ void sleepWatch(uint32_t now) {
     if (g_wakeKind && !g_wakeSent && now - g_bootMs < 15000) return;
     const uint32_t t = ms();                             // not the pass's now: g_quietSince may be newer
     if (static_cast<int32_t>(t - g_quietSince) < 2000) return;
-    ESP_LOGI(TAG, "sleeping%s%s, awake %u ms", tl ? ", timer" : "", motion ? ", motion" : "",
-             static_cast<unsigned>(t - g_bootMs));
-    if (tl) esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(tl) * 1000000ull);
-    if (motion) {
-        // The PIR's line held low while asleep, so an unplugged sensor cannot
-        // wake the satellite on noise: the pull lives in the RTC domain,
-        // which stays powered for it.
-        const gpio_num_t g = static_cast<gpio_num_t>(g_set.motionPin);
-        esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
-        rtc_gpio_pullup_dis(g);
-        rtc_gpio_pulldown_en(g);
-        esp_sleep_enable_ext0_wakeup(g, 1);
-    }
-    ledSet(false);
-    esp_deep_sleep_start();
+    ESP_LOGI(TAG, "awake %u ms", static_cast<unsigned>(t - g_bootMs));
+    goSleep();
 }
 
 void linkTask(void*) {
@@ -629,15 +683,33 @@ extern "C" void app_main(void) {
     if (!cam::begin()) ESP_LOGE(TAG, "no PSRAM for the picture buffer");
 
     switch (esp_sleep_get_wakeup_cause()) {
+        case ESP_SLEEP_WAKEUP_TIMER: {
+            const bool tlDue = (g_set.tlMin || g_set.tlSec) && rtcUs() + 1000000ull >= r_tlDueUs;
+            if (!tlDue) {
+                // Only to arm the motion sensor: no radio, straight back.
+                ESP_LOGI(TAG, "woken to arm the motion sensor");
+                goSleep();
+            }
+            r_tlDueUs = 0;                                   // the next one from now
 #ifdef CAMSAT_BENCH_MOTION
-        // The bench, with no PIR wired: a timer wake stands in for a motion
-        // wake, so the board's side of a motion picture after sleep is tested.
-        case ESP_SLEEP_WAKEUP_TIMER: g_wakeKind = CEV_MOTION; break;
+            // The bench, with no PIR wired: a timelapse wake stands in for a
+            // motion wake, so the board's side of one after sleep is tested.
+            g_wakeKind = CEV_MOTION;
 #else
-        case ESP_SLEEP_WAKEUP_TIMER: g_wakeKind = CEV_TIMELAPSE; break;
+            g_wakeKind = CEV_TIMELAPSE;
 #endif
-        case ESP_SLEEP_WAKEUP_EXT0:  g_wakeKind = CEV_MOTION; g_motionWas = true; break;
-        default: break;
+            break;
+        }
+        case ESP_SLEEP_WAKEUP_EXT0:
+            g_wakeKind = CEV_MOTION;
+            g_motionWas = true;
+            r_motionUs = rtcUs();                            // the hold-off starts at the wake
+            r_motionSet = true;
+            break;
+        default:
+            r_motionSet = false;                             // a power-up or reset: nothing held
+            r_tlDueUs = 0;
+            break;
     }
 
     const uint8_t ch = store::lastChannel();
