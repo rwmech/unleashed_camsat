@@ -197,7 +197,9 @@ struct Sat {
     uint32_t lastAt = 0;                     // epoch of its last picture
     uint32_t eventAt = 0;                    // millis of its last EVENT answered
 };
-Sat g_sat[ulink::Engine::kPeers];
+// On the heap from the first start, like the limits: a plugin that is off
+// costs the board no static RAM (every official image carries this one).
+Sat* g_sat = nullptr;
 
 int satPeer(uint8_t n) { return linkp::peerOfKind(ulink::KIND_CAMSAT, n); }
 
@@ -317,7 +319,8 @@ struct Job {
     std::atomic<bool> filed{ false };
     char     err[72] = {};
 };
-Job g_job;
+Job* g_jobp = nullptr;                     // the heap, from the first start
+inline Job& job() { return *g_jobp; }
 uint16_t g_reqNext = 1;
 uint32_t g_tlSlot = 0;
 bool     g_tlPrimed = false;
@@ -330,10 +333,10 @@ Closing  g_closing;
 char     g_last[112] = {};
 char     g_lastBy[BBS_USER_MAX + 8] = {};
 
-bool busy() { return g_job.ph.load() != J_IDLE; }
+bool busy() { return g_jobp && g_jobp->ph.load() != J_IDLE; }
 
 Session* waiter() {
-    Job& j = g_job;
+    Job& j = job();
     if (!j.waiting || j.node == 0xFF) return nullptr;
     Session* s = nullptr;
     struct Find { uint8_t id; Session** out; } f{ j.node, &s };
@@ -418,7 +421,7 @@ size_t snapMsg(uint8_t* b, size_t cap, uint16_t req, uint8_t reason, const struc
 // The picture's bytes: the runner's (bulkData, bulkFinish)
 // ---------------------------------------------------------------------------
 bool bulkBegin(uint8_t peer, uint16_t sess, uint8_t type, uint32_t total) {
-    Job& j = g_job;
+    Job& j = job();
     if (type != CAM_PICTURE || j.ph.load() != J_ASKED || peer != j.peer || sess != j.sess) return false;
     if (total <= kPictureHeader || total > ulink::kBulkMax) return false;
     j.headGot = 0;
@@ -430,7 +433,7 @@ bool bulkBegin(uint8_t peer, uint16_t sess, uint8_t type, uint32_t total) {
 }
 
 bool bulkData(uint8_t, uint16_t sess, const uint8_t* p, size_t n) {
-    Job& j = g_job;
+    Job& j = job();
     if (sess != j.sess || j.ph.load() != J_COMING) return false;
     while (n && j.headGot < kPictureHeader) { j.head[j.headGot++] = *p++; --n; }
     if (!n) return true;
@@ -444,7 +447,7 @@ bool bulkData(uint8_t, uint16_t sess, const uint8_t* p, size_t n) {
 }
 
 void bulkFinish(uint8_t, uint16_t sess, bool ok) {
-    Job& j = g_job;
+    Job& j = job();
     if (sess != j.sess || !j.writerOpen) return;
     j.writerOpen = false;
     if (!ok) {
@@ -474,7 +477,7 @@ void notifyStaff(uint8_t fromNode) {
 
 // finish: the picture is filed or not; tell whoever is waiting, go idle.
 void finish(bool ok) {
-    Job& j = g_job;
+    Job& j = job();
     ulink::Engine* e = linkp::engine();
     if (e && j.ours) {
         if (g_closing.on) e->closeAfter(g_closing.peer, g_closing.sess);   // the one before, now
@@ -538,14 +541,14 @@ void finish(bool ok) {
 }
 
 void bulkEnd(uint8_t, uint16_t sess, bool) {
-    Job& j = g_job;
+    Job& j = job();
     if (sess != j.sess || j.ph.load() != J_COMING) return;
     // bulkFinish has run on the runner by now: it filed the picture or said why not.
     finish(j.filed.load());
 }
 
 void failWith(const char* why) {
-    snprintf(g_job.err, sizeof(g_job.err), "%s", why);
+    snprintf(job().err, sizeof(job().err), "%s", why);
     finish(false);
 }
 
@@ -557,7 +560,7 @@ bool startSystem(int peer, uint16_t sess, uint8_t reason) {
     ulink::Engine* e = linkp::engine();
     struct tm t;
     if (!e || busy() || peer < 0 || !plat::sdBase()[0] || !localNow(t)) return false;
-    Job& j = g_job;
+    Job& j = job();
     const char* folder = reason == CR_MOTION ? camrules::kMotionFolder : camrules::kTlFolder;
     const char* prefix = reason == CR_MOTION ? "MO" : camrules::kTlPrefix;
     if (!camrules::systemName(folder, prefix, t, j.rel, sizeof(j.rel))) return false;
@@ -599,7 +602,7 @@ bool message(uint8_t peer, uint16_t sess, uint8_t type, const uint8_t* p, size_t
             }
             return true;
         case CAM_SNAP_FAIL:
-            if (n >= 3 && sess == g_job.sess && g_job.ph.load() == J_ASKED) {
+            if (n >= 3 && sess == job().sess && job().ph.load() == J_ASKED) {
                 static const char* const kWhy[] = { "the satellite failed", "the satellite has no camera",
                                                     "the satellite is out of memory", "the satellite is busy",
                                                     "the satellite's flash failed", "the satellite's camera gave no picture" };
@@ -622,7 +625,7 @@ bool message(uint8_t peer, uint16_t sess, uint8_t type, const uint8_t* p, size_t
 }
 
 void reset(uint8_t, uint16_t sess, uint8_t reason) {
-    if (sess != g_job.sess || !busy()) return;
+    if (sess != job().sess || !busy()) return;
     char why[48];
     snprintf(why, sizeof(why), "the link to the satellite dropped (%u)", static_cast<unsigned>(reason));
     failWith(why);
@@ -632,7 +635,7 @@ void peerState(uint8_t peer, bool up) {
     ulink::Engine* e = linkp::engine();
     if (!e || e->peerKind(peer) != ulink::KIND_CAMSAT) return;
     if (up && g_running) sendSettings(peer);
-    if (!up && busy() && g_job.peer == peer && g_job.ph.load() == J_ASKED) failWith("the satellite went quiet");
+    if (!up && busy() && job().peer == peer && job().ph.load() == J_ASKED) failWith("the satellite went quiet");
 }
 
 const linkp::Family kFamily = [] {
@@ -653,7 +656,7 @@ const linkp::Family kFamily = [] {
 // tick: every 20 ms (PF_FAST). The spinner, the timeouts, the timelapse.
 // ---------------------------------------------------------------------------
 void tick(uint32_t now) {
-    Job& j = g_job;
+    Job& j = job();
     if (g_closing.on && static_cast<int32_t>(now - g_closing.at) >= 0) {
         if (ulink::Engine* e = linkp::engine()) e->closeAfter(g_closing.peer, g_closing.sess);
         g_closing.on = false;
@@ -731,7 +734,7 @@ void cmdSnapshot(Bbs& b, Session& s, const char* arg, uint32_t now) {
     if (busy()) { refuse(b, s, "The camera is busy. Try again in a moment."); return; }
     struct tm t;
     localNow(t);
-    Job& j = g_job;
+    Job& j = job();
     if (!camrules::callerName(g_set.names, t, s.user, s.guest, j.rel, sizeof(j.rel))) {
         refuse(b, s, "That photo's name would be too long.");
         return;
@@ -806,7 +809,7 @@ void onRename(const char* oldHandle, const char* newHandle) {
 }
 
 void onLogoff(Session& s) {
-    if (g_job.node == s.id) g_job.waiting = false;       // the photo is still filed and counted
+    if (g_jobp && g_jobp->node == s.id) g_jobp->waiting = false;       // the photo is still filed and counted
 }
 
 // ---------------------------------------------------------------------------
@@ -928,6 +931,18 @@ bool start(Bbs&) {
     g_index = plugins::indexOf(kName);
     g_set = Settings();
     plugins::forEachKey(g_index, readKey, nullptr);
+    if (!g_jobp) {                                         // once, and kept: a CONFIG save restarts plugins
+        g_jobp = new (std::nothrow) Job();
+        g_sat = new (std::nothrow) Sat[ulink::Engine::kPeers]();
+        if (!g_jobp || !g_sat) {
+            delete g_jobp;
+            delete[] g_sat;
+            g_jobp = nullptr;
+            g_sat = nullptr;
+            plat::log("camsat: not enough memory to start");
+            return false;
+        }
+    }
     if (!linkp::registerFamily(kFamily)) {
         plat::log("camsat: the camera family is taken (another camera plugin?)");
         return false;
