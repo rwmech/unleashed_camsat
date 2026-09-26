@@ -78,14 +78,24 @@ From then on the satellite finds its board by itself after every power cut, and 
 
 | Command | Who | What |
 |---|---|---|
-| `SNAPSHOT [n]` | callers (as the sysop sets) | take a photo; `n` picks a satellite when there are several |
-| `CAMSAT` | staff | the satellites: up or quiet, sensor, signal, photos taken |
+Each paired satellite is a camera in the board's own camera list, under the name LINK gives it (`LINK NAME` changes it). The board's commands work the same whether a camera is built in or a satellite:
+
+| Command | Who | What |
+|---|---|---|
+| `SNAPSHOT [n\|name]` | callers (as the sysop sets) | take a photo with the default camera, or camera `n` or `name` |
+| `CAMERA` | staff | every camera on the board: up, busy or down, and what each is doing |
+| `CAMERA <n\|name>` | staff | one satellite: the link and its signal, the sensor, memory, uptime, photos taken |
 | `LINK` | staff | every paired device on the link |
+| `CONFIG cameras` | sysop | which camera `SNAPSHOT` uses when none is named |
 | `CONFIG camsat` | sysop | size, quality, names, watermark, flash, timelapse, motion, picture settings, deep sleep |
+
+With one camera on the board, `SNAPSHOT` is simply that camera and `CAMERA` shows it directly.
 
 Photos land in the Photos area (FILES), named like a built-in camera's: `SNAP-20260926-114523.JPG` for a caller's, `timelapse/TL-...` and `motion/MO-...` for the board's own.
 
-Callers get the same limits a built-in camera gives them: 10 photos an hour and 20 a day each, the sysop exempt.
+Callers get one allowance across every camera on the board: 10 photos an hour and 20 a day each, the sysop exempt.
+
+This needs µnleashed BBS 1.2.0 or later, which carries the link and the camera list.
 
 ## How it works
 
