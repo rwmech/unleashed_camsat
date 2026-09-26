@@ -81,6 +81,7 @@ struct Pic {
     uint32_t srcBytes = 0;
     uint8_t  settleFrames = 0;
     bool     marked = false, fixed = false, flashed = false;
+    bool     stuck = false;       // a sensor that answered this boot and now does not
 };
 
 namespace cam {

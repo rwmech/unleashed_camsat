@@ -479,7 +479,7 @@ void notifyStaff(uint8_t fromNode) {
 void finish(bool ok) {
     Job& j = job();
     ulink::Engine* e = linkp::engine();
-    if (e && j.ours) {
+    if (e) {                                   // ours or the satellite's (an EVENT): let it go
         if (g_closing.on) e->closeAfter(g_closing.peer, g_closing.sess);   // the one before, now
         g_closing = Closing{ true, j.peer, j.sess, plat::millis() + 3000 };
     }
@@ -600,6 +600,7 @@ bool message(uint8_t peer, uint16_t sess, uint8_t type, const uint8_t* p, size_t
                 s.lastErr = p[14];
                 snprintf(s.sensor, sizeof(s.sensor), "%.11s", reinterpret_cast<const char*>(p + 16));
             }
+            e->closeAfter(peer, sess);                 // one message a session: the table holds 16
             return true;
         case CAM_SNAP_FAIL:
             if (n >= 3 && sess == job().sess && job().ph.load() == J_ASKED) {
@@ -672,9 +673,12 @@ void tick(uint32_t now) {
         }
         return;
     }
-    // Not for ever: a satellite that went away mid-picture.
-    if (ph == J_ASKED && now - j.startedAt > 30000) { failWith("the satellite did not answer"); return; }
-    if (ph == J_COMING && now - j.startedAt > 120000) {
+    // Not for ever: a satellite that went away mid-picture. Signed: a job
+    // started from the link's message in this same pass has a start later
+    // than this tick's now (the bench: every EVENT failed at once).
+    const int32_t age = static_cast<int32_t>(now - j.startedAt);
+    if (ph == J_ASKED && age > 30000) { failWith("the satellite did not answer"); return; }
+    if (ph == J_COMING && age > 120000) {
         if (ulink::Engine* e = linkp::engine()) e->resetSession(j.peer, j.sess, ulink::R_CLOSED);
         failWith("the picture took too long to come");
         return;
@@ -859,7 +863,7 @@ const Command kCommands[] = {
 // ---------------------------------------------------------------------------
 // CONFIG camsat
 // ---------------------------------------------------------------------------
-const PluginSetting kSettings[] = {
+const PluginSetting kConfig[] = {
     { "snap",      "Snap",      PS_CYCLE, 0, 0, 6, "Who may take a photo.", kLevels, "Who may take a photo" },
     { "photos",    "Photos",    PS_CYCLE, 0, 0, 6, "Who may see and download photos.", kLevels, "Who may see photos" },
     { "size",      "Size",      PS_CYCLE, 0, 0, 5, "The satellite's picture size.", kSizes, "Resolution" },
@@ -1002,8 +1006,8 @@ extern const Plugin kCamsatPlugin = {
     status,
     kCommands,
     sizeof(kCommands) / sizeof(kCommands[0]),
-    kSettings,
-    sizeof(kSettings) / sizeof(kSettings[0]),
+    kConfig,
+    sizeof(kConfig) / sizeof(kConfig[0]),
     setting,
     nullptr,                 // rows
     nullptr,                 // onPresence

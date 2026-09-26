@@ -45,6 +45,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sensor.h"
@@ -166,6 +167,35 @@ bool open(framesize_t fs, uint8_t quality, const PicSettings& s, char* err, size
 
 void close() {
     if (esp_camera_sensor_get()) esp_camera_deinit();
+}
+
+// unstick: the sensor stopped answering on its SCCB bus (seen on the bench,
+// now and then, after a picture that went fine: every later bring-up then
+// finds nothing until the satellite restarts). Clock SDA free if the sensor
+// is holding it, and power the sensor down and up again through PWDN.
+void unstick() {
+    const gpio_num_t sda = static_cast<gpio_num_t>(CAM_SIOD), scl = static_cast<gpio_num_t>(CAM_SIOC);
+    gpio_reset_pin(sda);
+    gpio_reset_pin(scl);
+    gpio_set_direction(sda, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(sda, GPIO_PULLUP_ONLY);
+    gpio_set_direction(scl, GPIO_MODE_OUTPUT_OD);
+    gpio_set_pull_mode(scl, GPIO_PULLUP_ONLY);
+    for (int i = 0; i < 9 && gpio_get_level(sda) == 0; ++i) {
+        gpio_set_level(scl, 0);
+        esp_rom_delay_us(10);
+        gpio_set_level(scl, 1);
+        esp_rom_delay_us(10);
+    }
+    gpio_reset_pin(sda);
+    gpio_reset_pin(scl);
+    const gpio_num_t pwdn = static_cast<gpio_num_t>(CAM_PWDN);
+    gpio_reset_pin(pwdn);
+    gpio_set_direction(pwdn, GPIO_MODE_OUTPUT);
+    gpio_set_level(pwdn, 1);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    gpio_set_level(pwdn, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
 }
 
 // meter: the OV2640's exposure and gain, or the GC0308's average and
@@ -420,7 +450,18 @@ bool snap(const SnapReq& r, const PicSettings& s, Pic& pic) {
 
     const uint32_t t0 = ms();
     char why[48] = "";
-    if (!open(frameOf(size), q, s, why, sizeof(why))) return fail(linkfam::CE_NOSENSOR, why);
+    if (!open(frameOf(size), q, s, why, sizeof(why))) {
+        // Once more after freeing the bus and power-cycling the sensor. A
+        // sensor that answered earlier this boot and still does not is the
+        // satellite's to restart (main.cpp), which the bench found clears it.
+        ESP_LOGW(TAG, "the sensor did not answer: freeing its bus and trying again");
+        unstick();
+        if (!open(frameOf(size), q, s, why, sizeof(why))) {
+            pic.stuck = g_sensor[0] != '\0';
+            return fail(linkfam::CE_NOSENSOR, why);
+        }
+        ESP_LOGW(TAG, "the sensor answered the second time");
+    }
     if (fl == linkfam::CF_ON) { flash(true); pic.flashed = true; }
     pic.settleFrames = settle();
     if (fl == linkfam::CF_AUTO && !pic.flashed) {

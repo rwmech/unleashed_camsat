@@ -218,6 +218,8 @@ void SatRadio::delPeer(const ulink::Mac& m) {
     if (esp_now_is_peer_exist(m.b)) esp_now_del_peer(m.b);
 }
 
+uint8_t SatRadio::macFailStreak() { return g_streak.load(); }
+
 uint32_t SatRadio::heapFree() { return static_cast<uint32_t>(esp_get_free_heap_size()); }
 
 uint32_t SatRadio::ringDrops() const { return g_drops.load(); }

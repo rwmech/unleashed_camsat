@@ -60,6 +60,7 @@ public:
     bool addPeer(const ulink::Mac& m) override;
     void delPeer(const ulink::Mac& m) override;
     uint32_t heapFree() override;
+    uint8_t macFailStreak() override;
 
     // For the console and STATUS.
     uint32_t ringDrops() const;

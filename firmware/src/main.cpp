@@ -49,6 +49,7 @@
 #include <cstring>
 
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
@@ -142,6 +143,8 @@ uint32_t g_quietSince = 0;                // nothing to do since, for sleep
 uint32_t g_motionAt = 0;                  // the last motion EVENT
 bool     g_motionWas = false;
 uint32_t g_forgetFrom = 0;
+uint16_t g_eventSess = 0;                 // an EVENT waiting for the board's SNAP
+uint32_t g_eventAt = 0;
 
 uint32_t unixNow() {
     return g_unixAt ? g_unixAt + (ms() - g_unixMs) / 1000 : 0;
@@ -248,6 +251,8 @@ bool sendEvent(uint8_t kind) {
         return false;
     }
     ESP_LOGI(TAG, "asked the board for a %s picture", kind == CEV_MOTION ? "motion" : "timelapse");
+    g_eventSess = sess;
+    g_eventAt = ms();
     return true;
 }
 
@@ -270,6 +275,7 @@ void clampSettings(SatSettings& s) {
 void motionPinSetup() {
     if (!g_set.motion) return;
     const gpio_num_t g = static_cast<gpio_num_t>(g_set.motionPin);
+    if (rtc_gpio_is_valid_gpio(g)) rtc_gpio_deinit(g);       // back from deep sleep's RTC mux
     gpio_reset_pin(g);
     gpio_set_direction(g, GPIO_MODE_INPUT);
     gpio_set_pull_mode(g, GPIO_PULLDOWN_ONLY);
@@ -310,12 +316,13 @@ void onSettings(uint16_t sess, const uint8_t* p, size_t n) {
                  g_set.motionPin, g_set.holdoffS, g_set.sleep ? "deep sleep between pictures" : "awake");
     }
     sendSettingsOk(sess);
+    g_eng->closeAfter(0, sess);
 }
 
 void onSnap(uint16_t sess, const uint8_t* p, size_t n) {
     if (n < 6) return;
     const uint16_t req = get16(p);
-    if (g_job.ph.load() != P_IDLE) { sendFail(sess, req, CE_BUSY); return; }
+    if (g_job.ph.load() != P_IDLE) { sendFail(sess, req, CE_BUSY); g_eng->closeAfter(0, sess); return; }
     Job& j = g_job;
     j.r = SnapReq();
     j.r.size = p[2];
@@ -329,6 +336,7 @@ void onSnap(uint16_t sess, const uint8_t* p, size_t n) {
         text(j.r.who, sizeof(j.r.who), p + 43, 24);
         text(j.r.comment, sizeof(j.r.comment), p + 67, n - 67);
     }
+    if (sess == g_eventSess) g_eventSess = 0;
     j.sess = sess;
     j.req = req;
     j.ours = sess & 0x8000;
@@ -347,7 +355,11 @@ bool evMessage(void*, uint8_t, uint16_t sess, uint8_t family, uint8_t type, cons
 }
 
 void jobDone() {
-    if (g_job.ours) g_eng->closeAfter(0, g_job.sess);
+    // Every picture's session is let go here, the board's as well as ours:
+    // the engine keeps a session the far end has finished with for two
+    // minutes, and its table holds 16, so a 10 s timelapse filled it in
+    // 160 s and every SNAP after that was refused (the bench, 2026-09-26).
+    if (g_job.sess) g_eng->closeAfter(0, g_job.sess);
     g_job.ph.store(P_IDLE);
     g_led = g_eng->hostUp() ? Led::Up : Led::Search;
     g_quietSince = ms();
@@ -397,6 +409,13 @@ void evPaired(void*, uint8_t, const PairInfo& who) {
     ESP_LOGI(TAG, "paired with %02x:%02x:%02x:%02x:%02x:%02x, code %04u", who.mac.b[0], who.mac.b[1],
              who.mac.b[2], who.mac.b[3], who.mac.b[4], who.mac.b[5], static_cast<unsigned>(who.code));
     g_led = Led::Search;
+}
+
+// Pairing: the code, worked out before the sysop answers at the board, so
+// whoever has this console can compare the two.
+void evPairAsk(void*, const PairInfo& who) {
+    ESP_LOGW(TAG, "pairing with the board \"%s\": code %04u. The board shows the same code if nobody is in between.",
+             who.name, static_cast<unsigned>(who.code));
 }
 
 void evChannel(void*, uint8_t ch) {
@@ -454,7 +473,12 @@ void forgetWatch(uint32_t now) {
 
 void motionWatch(uint32_t now) {
     if (!g_set.motion || !g_eng->hostUp()) return;
+#ifdef CAMSAT_BENCH_MOTION
+    // The bench, with no PIR wired: "movement" for 5 s every 45 s.
+    const bool high = (now % 45000) < 5000;
+#else
     const bool high = gpio_get_level(static_cast<gpio_num_t>(g_set.motionPin)) != 0;
+#endif
     const bool rise = high && !g_motionWas;
     g_motionWas = high;
     if (!rise) return;
@@ -477,7 +501,16 @@ void sleepWatch(uint32_t now) {
     if (g_wakeKind && !g_wakeSent && now - g_bootMs < 15000) return;   // still finding the board
     ESP_LOGI(TAG, "sleeping%s%s", tl ? ", timer" : "", motion ? ", motion" : "");
     if (tl) esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(tl) * 1000000ull);
-    if (motion) esp_sleep_enable_ext0_wakeup(static_cast<gpio_num_t>(g_set.motionPin), 1);
+    if (motion) {
+        // The PIR's line held low while asleep, so an unplugged sensor cannot
+        // wake the satellite on noise: the pull lives in the RTC domain,
+        // which stays powered for it.
+        const gpio_num_t g = static_cast<gpio_num_t>(g_set.motionPin);
+        esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+        rtc_gpio_pullup_dis(g);
+        rtc_gpio_pulldown_en(g);
+        esp_sleep_enable_ext0_wakeup(g, 1);
+    }
     ledSet(false);
     esp_deep_sleep_start();
 }
@@ -516,11 +549,33 @@ void linkTask(void*) {
             }
             g_job.ph.store(P_IDLE);
             g_led = Led::Pairing;
+#ifdef CAMSAT_SELFTEST_AGAIN
+            // The bench: a settings save between pictures, then another one.
+            static int again = 0;
+            if (again++ < 2) {
+                if (again == 1) { store::saveSettings(g_set); ESP_LOGI(TAG, "selftest: settings saved"); }
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                g_job.ph.store(P_TAKING);
+                xTaskNotifyGive(g_camTask);
+            }
+#endif
         }
         else
 #endif
         if (ph == P_READY) sendPicture();
-        else if (ph == P_FAILED) { sendFail(g_job.sess, g_job.req, g_job.pic.failCode); jobDone(); }
+        else if (ph == P_FAILED) {
+            sendFail(g_job.sess, g_job.req, g_job.pic.failCode);
+            const bool stuck = g_job.pic.stuck;
+            jobDone();
+            if (stuck) {
+                // The sensor answered earlier this boot and cannot be woken:
+                // a restart clears it (the bench, 2026-09-26). The failure
+                // goes first; the pairing and the channel are kept.
+                ESP_LOGE(TAG, "the camera is stuck: restarting");
+                for (int i = 0; i < 50; ++i) { g_eng->poll(); vTaskDelay(pdMS_TO_TICKS(10)); }
+                esp_restart();
+            }
+        }
         if (g_eng->hostUp()) {
             if (!g_statusAt || now - g_statusAt >= 60000) { g_statusAt = now; sendStatus(); }
             if (g_wakeKind && !g_wakeSent) g_wakeSent = sendEvent(g_wakeKind);
@@ -530,6 +585,10 @@ void linkTask(void*) {
             g_pairUntil = 0;
             g_led = Led::Off;
             ESP_LOGW(TAG, "no board answered in 5 minutes; reset the satellite to pair again");
+        }
+        if (g_eventSess && now - g_eventAt > 10000) {    // the board let the EVENT go
+            g_eng->closeSession(0, g_eventSess);
+            g_eventSess = 0;
         }
         forgetWatch(now);
         motionWatch(now);
@@ -580,6 +639,7 @@ extern "C" void app_main(void) {
     ev.reset = evReset;
     ev.peerState = evPeerState;
     ev.paired = evPaired;
+    ev.pairAsk = evPairAsk;
     ev.channel = evChannel;
     ev.clock = evClock;
     static uint8_t win[4 * kPayloadMax];            // a satellite receives no bulk
@@ -590,6 +650,7 @@ extern "C" void app_main(void) {
         esp_restart();
     }
     g_eng->setIdentity(KIND_CAMSAT, CAMSAT_VERSION, 1u << FAM_CAMERA);
+    g_eng->setFastRescan(true);
 
     uint8_t key[16];
     Mac host;
