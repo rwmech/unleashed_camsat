@@ -525,6 +525,9 @@ void sleepWatch(uint32_t now) {
 void linkTask(void*) {
     for (;;) {
         const uint32_t now = ms();
+        // Four polls a tick. Polling the whole millisecond while a picture
+        // goes out was measured on link.6 and changed nothing (80-85 KB/s
+        // either way): the pace is set by the board's acknowledgements.
         for (int i = 0; i < 4; ++i) g_eng->poll();
         if (g_eng->pairComputeWanted()) g_eng->pairCompute();
         const uint8_t ph = g_job.ph.load();

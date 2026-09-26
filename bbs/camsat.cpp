@@ -11,9 +11,16 @@
 //               (LINK PAIR), and this plugin asks it for pictures and files
 //               them in Photos exactly as a built-in camera's: named by
 //               camrules (SNAP-date, date+handle or by handle; timelapse/TL-
-//               and motion/MO- for the board's own), the same limits a caller
-//               (camrules, 10 an hour and 20 a day, the sysop free of them),
-//               the same watermark and comment, the same download offer.
+//               and motion/MO- for the board's own), the same watermark and
+//               comment, the same download offer.
+//
+//               Each paired satellite is a camera in the core's list
+//               (photos::Camera, 1.2.0): SNAPSHOT and CAMERA are the core's,
+//               one pair for every camera on the board, and so is the
+//               per-caller budget (photos::budget, 10 an hour and 20 a day
+//               across every camera, the sysop free of it). A satellite is
+//               listed while it is paired, named as LINK names it, and says
+//               so when it is not answering.
 //
 //               The board chooses every word and every name. The satellite
 //               takes the picture and does the pixel work (levels, gamma, the
@@ -189,6 +196,12 @@ uint32_t tlEvery() {
 // The satellites the board has seen this boot, by link peer.
 // ---------------------------------------------------------------------------
 struct Sat {
+    // Its entry in the board's camera list, kept here so the pointer the
+    // registry holds lives as long as the listing.
+    photos::Camera cam = {};
+    char     name[17] = {};
+    uint8_t  peer = 0;
+    bool     listed = false;
     bool     known = false;
     char     sensor[12] = {};
     uint32_t heap = 0, psram = 0, uptime = 0;
@@ -216,73 +229,6 @@ int firstUp() {
         if (peerUp(p)) return p;
     }
     return -1;
-}
-
-// ---------------------------------------------------------------------------
-// Per caller limits (the built-in camera's: camera.cpp), on the heap once.
-// ---------------------------------------------------------------------------
-enum : uint8_t { WHO_FREE = 0, WHO_ACCOUNT, WHO_ADDR, WHO_GUESTNAME };
-struct Who {
-    uint8_t          kind = WHO_FREE;
-    uint32_t         key  = 0;
-    camrules::Window w;
-};
-constexpr uint8_t kWho = 24;
-Who* g_who = nullptr;
-
-uint32_t fnv(const char* s) {
-    uint32_t h = 2166136261u;
-    for (; *s; ++s) { h ^= static_cast<uint8_t>(tolower(static_cast<unsigned char>(*s))); h *= 16777619u; }
-    return h;
-}
-
-uint8_t whoKeys(const Session& s, uint8_t kind[2], uint32_t key[2]) {
-    if (!s.guest) { kind[0] = WHO_ACCOUNT; key[0] = fnv(s.user); return 1; }
-    kind[0] = WHO_ADDR;      key[0] = s.ipAddr;
-    kind[1] = WHO_GUESTNAME; key[1] = fnv(s.user);
-    return 2;
-}
-
-Who* whoSlot(uint8_t kind, uint32_t key, uint32_t now, bool make) {
-    if (!g_who) return nullptr;
-    Who* freeOne = nullptr;
-    Who* stalest = &g_who[0];
-    for (uint8_t i = 0; i < kWho; ++i) {
-        Who& w = g_who[i];
-        camrules::age(w.w, now);
-        if (w.kind == kind && w.key == key) return &w;
-        if (w.kind == WHO_FREE || !w.w.n) { if (!freeOne) freeOne = &w; continue; }
-        if (w.w.at[w.w.n - 1] < stalest->w.at[stalest->w.n ? stalest->w.n - 1 : 0]) stalest = &w;
-    }
-    if (!make) return nullptr;
-    Who* w = freeOne ? freeOne : stalest;
-    *w = Who();
-    w->kind = kind;
-    w->key = key;
-    return w;
-}
-
-camrules::Verdict verdictFor(const Session& s, uint32_t now) {
-    uint8_t kind[2]; uint32_t key[2];
-    const uint8_t n = whoKeys(s, kind, key);
-    camrules::Verdict v;
-    for (uint8_t i = 0; i < n; ++i) {
-        Who* w = whoSlot(kind[i], key[i], now, false);
-        if (!w) continue;
-        const camrules::Verdict x = camrules::check(w->w, now);
-        if (x.hour > v.hour) v.hour = x.hour;
-        if (x.day > v.day)   v.day = x.day;
-        if (!x.ok && (v.ok || x.nextAt > v.nextAt)) { v.nextAt = x.nextAt; v.byDay = x.byDay; }
-        if (!x.ok) v.ok = false;
-    }
-    return v;
-}
-
-void recordFor(const Session& s, uint32_t now) {
-    uint8_t kind[2]; uint32_t key[2];
-    const uint8_t n = whoKeys(s, kind, key);
-    for (uint8_t i = 0; i < n; ++i)
-        if (Who* w = whoSlot(kind[i], key[i], now, true)) camrules::record(w->w, now);
 }
 
 // The photo each node was offered (the built-in's g_offer).
@@ -553,6 +499,7 @@ void failWith(const char* why) {
 }
 
 bool message(uint8_t peer, uint16_t sess, uint8_t type, const uint8_t* p, size_t n);
+void reconcile();
 
 // startSystem: a picture the board takes for itself (timelapse, motion),
 // on a session this board opens, or on the satellite's own (an EVENT).
@@ -657,6 +604,8 @@ const linkp::Family kFamily = [] {
 // tick: every 20 ms (PF_FAST). The spinner, the timeouts, the timelapse.
 // ---------------------------------------------------------------------------
 void tick(uint32_t now) {
+    static uint32_t listedAt = 0;
+    if (static_cast<int32_t>(now - listedAt) >= 1000) { listedAt = now; reconcile(); }
     Job& j = job();
     if (g_closing.on && static_cast<int32_t>(now - g_closing.at) >= 0) {
         if (ulink::Engine* e = linkp::engine()) e->closeAfter(g_closing.peer, g_closing.sess);
@@ -693,38 +642,26 @@ void tick(uint32_t now) {
 }
 
 // ---------------------------------------------------------------------------
-// SNAPSHOT [n]: a picture from satellite n (the first that is up).
+// SNAPSHOT: a picture from one satellite, as the core's SNAPSHOT [n|name]
+// picks it (photos::Camera::snap).
 // ---------------------------------------------------------------------------
 void refuse(Bbs& b, Session& s, const char* why) {
     say(s, Color::LightRed, why);
     b.prompt(s);
 }
 
-void cmdSnapshot(Bbs& b, Session& s, const char* arg, uint32_t now) {
+void snapFrom(Bbs& b, Session& s, int peer, uint32_t now) {
     ulink::Engine* e = linkp::engine();
     if (!g_running || !plat::sdBase()[0]) { refuse(b, s, "The camera needs the SD card in."); return; }
     if (!e) { refuse(b, s, "The camera satellite needs the link: LINK."); return; }
     if (!plugins::mayUse(s, g_set.snap)) { refuse(b, s, "Taking photos is not open to you here."); return; }
     if (!clk::valid()) { refuse(b, s, "The board's clock is not set yet, and a photo is named by it."); return; }
-    int peer = -1;
-    if (arg && *arg) {
-        const int n = atoi(arg);
-        peer = n >= 1 ? satPeer(static_cast<uint8_t>(n - 1)) : -1;
-        if (peer < 0) { refuse(b, s, "There is no satellite with that number: CAMSAT lists them."); return; }
-        if (!peerUp(peer)) { refuse(b, s, "That satellite is not answering. Try again in a moment."); return; }
-    } else {
-        peer = firstUp();
-        if (peer < 0) {
-            refuse(b, s, satPeer(0) < 0 ? "No camera satellite is paired with this board."
-                                        : "The camera satellite is not answering. Try again in a moment.");
-            return;
-        }
-    }
+    if (!peerUp(peer)) { refuse(b, s, "That camera is not answering. Try again in a moment."); return; }
     const uint32_t epoch = clk::epoch();
     const bool sysop = plugins::mayUse(s, PlugLevel::Sysop);
-    camrules::Verdict v;
+    photos::Budget v;
     if (!sysop) {
-        v = verdictFor(s, epoch);
+        v = photos::budget(s, epoch);
         if (!v.ok) {
             char at[8], buf[96];
             clk::fmtEpoch(at, sizeof(at), "%H:%M", v.nextAt);
@@ -769,7 +706,7 @@ void cmdSnapshot(Bbs& b, Session& s, const char* arg, uint32_t now) {
     j.spinAt = now;
     j.ph.store(J_ASKED);
     if (!sysop) {
-        recordFor(s, epoch);
+        photos::spend(s, epoch);
         char buf[80];
         snprintf(buf, sizeof(buf), "Snapshot %u of %u this hour, %u of %u today.",
                  static_cast<unsigned>(v.hour + 1), static_cast<unsigned>(camrules::kPerHour),
@@ -805,60 +742,102 @@ void onKey(Session& s, int k, uint32_t now) {
     b.release(s);
 }
 
-void onRename(const char* oldHandle, const char* newHandle) {
-    if (!g_who) return;
-    const uint32_t from = fnv(oldHandle), to = fnv(newHandle);
-    for (uint8_t i = 0; i < kWho; ++i)
-        if (g_who[i].kind == WHO_ACCOUNT && g_who[i].key == from) g_who[i].key = to;
-}
-
 void onLogoff(Session& s) {
     if (g_jobp && g_jobp->node == s.id) g_jobp->waiting = false;       // the photo is still filed and counted
 }
 
 // ---------------------------------------------------------------------------
-// CAMSAT: the satellites, for staff
+// Each satellite in the board's camera list (photos::Camera). ctx is its Sat.
 // ---------------------------------------------------------------------------
-void cmdCamsat(Bbs& b, Session& s, const char*, uint32_t) {
+bool satUp(void* ctx) { return g_running && peerUp(static_cast<Sat*>(ctx)->peer); }
+
+bool satBusy(void* ctx) {
+    return busy() && g_jobp && g_jobp->peer == static_cast<Sat*>(ctx)->peer;
+}
+
+void satSnap(void* ctx, Bbs& b, Session& s, uint32_t now) {
+    snapFrom(b, s, static_cast<Sat*>(ctx)->peer, now);
+}
+
+// satLine: CAMERA's list line: the sensor, the signal, the pictures taken.
+void satLine(void* ctx, char* out, size_t n) {
+    const Sat& x = *static_cast<Sat*>(ctx);
     ulink::Engine* e = linkp::engine();
-    s.term.color(s.tl, Color::Cyan);
-    s.term.text(s.tl, "Camera satellites");
-    s.term.nl(s.tl);
-    int shown = 0;
-    for (uint8_t i = 0; e && i < ulink::Engine::kPeers; ++i) {
-        const int p = satPeer(i);
-        if (p < 0) break;
-        const Sat& x = g_sat[p];
-        const ulink::PeerStats& st = e->peerStats(static_cast<uint8_t>(p));
-        char line[120];
-        snprintf(line, sizeof(line), "%u %-16.16s %-5s %-8.8s %4d dBm  %lu photos", static_cast<unsigned>(i + 1),
-                 linkp::peerName(static_cast<uint8_t>(p)), e->peerUp(static_cast<uint8_t>(p)) ? "up" : "quiet",
-                 x.sensor[0] ? x.sensor : "-", static_cast<int>(st.rssi), static_cast<unsigned long>(x.pictures));
-        say(s, Color::White, line);
-        s.term.nl(s.tl);
-        ++shown;
+    if (!e || !e->peerUp(x.peer)) { snprintf(out, n, "satellite, not answering"); return; }
+    snprintf(out, n, "satellite, %s, %d dBm, %lu photo%s", x.sensor[0] ? x.sensor : "sensor not said",
+             static_cast<int>(e->peerStats(x.peer).rssi), static_cast<unsigned long>(x.pictures),
+             x.pictures == 1 ? "" : "s");
+}
+
+// satCommand: CAMERA <this satellite>: what the board knows of it, for staff.
+void satCommand(void* ctx, Bbs& b, Session& s, const char*, uint32_t) {
+    if (!plugins::mayUse(s, plugins::levelFor(g_index, 1))) {
+        refuse(b, s, "The camera's details are for staff.");
+        return;
     }
-    if (!shown) {
-        say(s, Color::Grey, e ? "None paired. LINK PAIR, then power the satellite up."
-                              : "The link is off: CONFIG link.");
-        s.term.nl(s.tl);
+    const Sat& x = *static_cast<Sat*>(ctx);
+    ulink::Engine* e = linkp::engine();
+    char line[160];
+    b.rowTitle(s, x.name);
+    if (!e) {
+        b.rowText(s, Color::Grey, "The link is off: CONFIG link.");
+        b.rowRule(s);
+        b.prompt(s);
+        return;
     }
+    const ulink::PeerStats& st = e->peerStats(x.peer);
+    snprintf(line, sizeof(line), "Link      %s, %d dBm here, %d dBm there", e->peerUp(x.peer) ? "up" : "quiet",
+             static_cast<int>(st.rssi), static_cast<int>(st.farRssi));
+    b.rowText(s, Color::White, line);
+    snprintf(line, sizeof(line), "Sensor    %s", x.sensor[0] ? x.sensor : "not said yet");
+    b.rowText(s, Color::White, line);
+    if (x.known) {
+        snprintf(line, sizeof(line), "Memory    %lu KB internal, %lu KB PSRAM free",
+                 static_cast<unsigned long>(x.heap / 1024), static_cast<unsigned long>(x.psram / 1024));
+        b.rowText(s, Color::White, line);
+        snprintf(line, sizeof(line), "Up        %lu min", static_cast<unsigned long>(x.uptime / 60));
+        b.rowText(s, Color::White, line);
+    }
+    snprintf(line, sizeof(line), "Photos    %lu since the board started", static_cast<unsigned long>(x.pictures));
+    b.rowText(s, Color::White, line);
     if (g_last[0]) {
-        char line[160];
-        snprintf(line, sizeof(line), "Last: %.100s by %s", g_last, g_lastBy);
-        say(s, Color::Grey, line);
-        s.term.nl(s.tl);
+        snprintf(line, sizeof(line), "Last      %.100s by %s", g_last, g_lastBy);
+        b.rowText(s, Color::Grey, line);
     }
+    b.rowRule(s);
     b.prompt(s);
 }
 
-const Command kCommands[] = {
-    { "SNAPSHOT", "", 0, CF_READ, "SNAPSHOT [n]", "take a photo with the camera satellite", cmdSnapshot,
-      Menu::Account, 45 },
-    { "SNAP", "", 0, CF_READ | CF_HIDDEN, "", "", cmdSnapshot, Menu::Hidden, 99 },
-    { "CAMSAT", "", 0, CF_WRITE, "CAMSAT", "the camera satellites: up, sensor, photos", cmdCamsat,
-      Menu::Staff, 61 },
-};
+// listed: a satellite is in the camera list while it is paired, under the
+// name LINK gives it. Checked a second at a time from tick, so a pairing, a
+// LINK NAME and a LINK FORGET each follow without a hook of their own.
+void reconcile() {
+    if (!g_sat) return;
+    ulink::Engine* e = linkp::engine();
+    for (uint8_t p = 0; p < ulink::Engine::kPeers; ++p) {
+        Sat& x = g_sat[p];
+        const bool want = g_running && e && e->peerUsed(p) && e->peerKind(p) == ulink::KIND_CAMSAT;
+        const char* name = want ? linkp::peerName(p) : "";
+        if (x.listed && (!want || strcmp(x.name, name ? name : ""))) {
+            photos::removeCamera(x.cam);
+            x.listed = false;
+        }
+        if (want && !x.listed) {
+            x.peer = p;
+            snprintf(x.name, sizeof(x.name), "%s", name && *name ? name : "satellite");
+            x.cam = photos::Camera{ x.name, static_cast<uint8_t>(1 + p), &x, satUp, satBusy, satSnap, satLine,
+                                    satCommand };
+            x.listed = photos::addCamera(x.cam);
+            if (!x.listed) plat::log("camsat: the board's camera list is full; \"%s\" is not in it", x.name);
+        }
+    }
+}
+
+void unlistAll() {
+    if (!g_sat) return;
+    for (uint8_t p = 0; p < ulink::Engine::kPeers; ++p)
+        if (g_sat[p].listed) { photos::removeCamera(g_sat[p].cam); g_sat[p].listed = false; }
+}
 
 // ---------------------------------------------------------------------------
 // CONFIG camsat
@@ -951,13 +930,11 @@ bool start(Bbs&) {
         plat::log("camsat: the camera family is taken (another camera plugin?)");
         return false;
     }
-    if (!g_who) {                                          // once: a CONFIG save keeps the counts
-        g_who = static_cast<Who*>(calloc(kWho, sizeof(Who)));
-        g_offer = static_cast<Offer*>(calloc(kSlots, sizeof(Offer)));
-    }
+    if (!g_offer) g_offer = static_cast<Offer*>(calloc(kSlots, sizeof(Offer)));
     photos::provide(kProvider);
     g_tlPrimed = false;
     g_running = true;
+    reconcile();                                           // SNAPSHOT and CAMERA reach them
     // Satellites already up get the settings now (a CONFIG save).
     for (uint8_t i = 0; i < ulink::Engine::kPeers; ++i) {
         const int p = satPeer(i);
@@ -970,6 +947,7 @@ bool start(Bbs&) {
 
 void stop() {
     g_running = false;
+    unlistAll();
     if (busy()) failWith("the camera was switched off");
     photos::withdraw(kProvider);
     linkp::unregisterFamily(ulink::FAM_CAMERA);
@@ -1004,14 +982,14 @@ extern const Plugin kCamsatPlugin = {
     onLogoff,
     onKey,
     status,
-    kCommands,
-    sizeof(kCommands) / sizeof(kCommands[0]),
+    nullptr,                 // commands: SNAPSHOT and CAMERA are the core's
+    0,
     kConfig,
     sizeof(kConfig) / sizeof(kConfig[0]),
     setting,
     nullptr,                 // rows
     nullptr,                 // onPresence
     nullptr,                 // onBytes
-    onRename,
+    nullptr,                 // onRename: the core carries a caller's budget
     nullptr,                 // listDone
 };
