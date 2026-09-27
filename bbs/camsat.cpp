@@ -264,6 +264,15 @@ struct Job {
     uint16_t pw = 0, ph2 = 0;
     std::atomic<bool> filed{ false };
     char     err[72] = {};
+    // The part-file is the runner's while it is inside bulkData or
+    // bulkFinish, and the loop's otherwise: wbusy is who holds it now. dead
+    // tells the runner the loop has given the picture up, so it closes the
+    // file itself; dying is the loop waiting to take it back (finish, from
+    // the next tick).
+    std::atomic<bool> wbusy{ false };
+    std::atomic<bool> dead{ false };
+    bool     dying = false;
+    bool     dyingOk = false;
 };
 Job* g_jobp = nullptr;                     // the heap, from the first start
 inline Job& job() { return *g_jobp; }
@@ -280,6 +289,23 @@ char     g_last[112] = {};
 char     g_lastBy[BBS_USER_MAX + 8] = {};
 
 bool busy() { return g_jobp && g_jobp->ph.load() != J_IDLE; }
+
+bool takeWriter() { bool e = false; return job().wbusy.compare_exchange_strong(e, true); }
+void giveWriter() { job().wbusy.store(false); }
+
+// dropWriter (loop): close a picture's part-file, but only while the runner
+// is not inside it. False: the runner has it now; it sees dead and closes
+// the file itself, and the loop comes back next tick. Closing it under the
+// runner's write was a FILE freed while in use (the bench, 2026-09-27: a
+// session reset or a CONFIG save while a picture was coming).
+bool dropWriter() {
+    Job& j = job();
+    j.dead.store(true);
+    if (!takeWriter()) return false;
+    if (j.writerOpen) { photos::abandon(j.w); j.writerOpen = false; }
+    giveWriter();
+    return true;
+}
 
 Session* waiter() {
     Job& j = job();
@@ -374,13 +400,12 @@ bool bulkBegin(uint8_t peer, uint16_t sess, uint8_t type, uint32_t total) {
     j.bytes = 0;
     j.writerOpen = false;
     j.filed.store(false);
+    j.dead.store(false);
     j.ph.store(J_COMING);
     return true;
 }
 
-bool bulkData(uint8_t, uint16_t sess, const uint8_t* p, size_t n) {
-    Job& j = job();
-    if (sess != j.sess || j.ph.load() != J_COMING) return false;
+bool bulkWrite(Job& j, const uint8_t* p, size_t n) {
     while (n && j.headGot < kPictureHeader) { j.head[j.headGot++] = *p++; --n; }
     if (!n) return true;
     if (!j.writerOpen) {
@@ -392,19 +417,36 @@ bool bulkData(uint8_t, uint16_t sess, const uint8_t* p, size_t n) {
     return true;
 }
 
+bool bulkData(uint8_t, uint16_t sess, const uint8_t* p, size_t n) {
+    Job& j = job();
+    if (sess != j.sess || j.ph.load() != J_COMING) return false;
+    if (!takeWriter()) return false;                   // the loop is closing it
+    bool ok = false;
+    if (j.dead.load()) {
+        if (j.writerOpen) { photos::abandon(j.w); j.writerOpen = false; }
+    } else {
+        ok = bulkWrite(j, p, n);
+    }
+    giveWriter();
+    return ok;
+}
+
 void bulkFinish(uint8_t, uint16_t sess, bool ok) {
     Job& j = job();
-    if (sess != j.sess || !j.writerOpen) return;
-    j.writerOpen = false;
-    if (!ok) {
-        photos::abandon(j.w);
-        snprintf(j.err, sizeof(j.err), "the picture came damaged");
-        return;
+    if (sess != j.sess || !takeWriter()) return;
+    if (j.writerOpen) {
+        j.writerOpen = false;
+        if (!ok || j.dead.load()) {
+            photos::abandon(j.w);
+            if (!ok) snprintf(j.err, sizeof(j.err), "the picture came damaged");
+        } else {
+            j.pw = get16(j.head + 4);
+            j.ph2 = get16(j.head + 6);
+            if (photos::file(j.w, j.rel, j.kind == K_CALLER ? j.desc : nullptr)) j.filed.store(true);
+            else snprintf(j.err, sizeof(j.err), "a photo with that name is already there, or the card refused it");
+        }
     }
-    j.pw = get16(j.head + 4);
-    j.ph2 = get16(j.head + 6);
-    if (photos::file(j.w, j.rel, j.kind == K_CALLER ? j.desc : nullptr)) j.filed.store(true);
-    else snprintf(j.err, sizeof(j.err), "a photo with that name is already there, or the card refused it");
+    giveWriter();
 }
 
 // ---------------------------------------------------------------------------
@@ -424,12 +466,13 @@ void notifyStaff(uint8_t fromNode) {
 // finish: the picture is filed or not; tell whoever is waiting, go idle.
 void finish(bool ok) {
     Job& j = job();
+    if (!dropWriter()) { j.dying = true; j.dyingOk = ok; return; }   // the runner's: next tick
+    j.dying = false;
     ulink::Engine* e = linkp::engine();
     if (e) {                                   // ours or the satellite's (an EVENT): let it go
         if (g_closing.on) e->closeAfter(g_closing.peer, g_closing.sess);   // the one before, now
         g_closing = Closing{ true, j.peer, j.sess, plat::millis() + 3000 };
     }
-    if (j.writerOpen) { photos::abandon(j.w); j.writerOpen = false; }
     if (ok) {
         snprintf(g_last, sizeof(g_last), "%.111s", j.rel);
         snprintf(g_lastBy, sizeof(g_lastBy), "%.21s", j.kind == K_CALLER ? j.handle : "the board");
@@ -566,7 +609,7 @@ bool message(uint8_t peer, uint16_t sess, uint8_t type, const uint8_t* p, size_t
 }
 
 void reset(uint8_t, uint16_t sess, uint8_t reason) {
-    if (sess != job().sess || !busy()) return;
+    if (sess != job().sess || !busy() || job().dying) return;
     char why[48];
     snprintf(why, sizeof(why), "the link to the satellite dropped (%u)", static_cast<unsigned>(reason));
     failWith(why);
@@ -604,6 +647,9 @@ void tick(uint32_t now) {
         if (ulink::Engine* e = linkp::engine()) e->closeAfter(g_closing.peer, g_closing.sess);
         g_closing.on = false;
     }
+    // A finish the runner held off: again, and a picture bulkFinish filed
+    // meanwhile is said as filed, not as the failure that asked.
+    if (j.dying) { finish(j.dyingOk || j.filed.load()); return; }
     const uint8_t ph = j.ph.load();
     if (ph == J_IDLE) {
         const uint32_t every = tlEvery();
@@ -621,8 +667,10 @@ void tick(uint32_t now) {
     const int32_t age = static_cast<int32_t>(now - j.startedAt);
     if (ph == J_ASKED && age > 30000) { failWith("the satellite did not answer"); return; }
     if (ph == J_COMING && age > 120000) {
-        if (ulink::Engine* e = linkp::engine()) e->resetSession(j.peer, j.sess, ulink::R_CLOSED);
-        failWith("the picture took too long to come");
+        const uint8_t peer = j.peer;
+        const uint16_t sess = j.sess;
+        failWith("the picture took too long to come");   // first: the reset below then finds it ended
+        if (ulink::Engine* e = linkp::engine()) e->resetSession(peer, sess, ulink::R_CLOSED);
         return;
     }
     Session* s = waiter();
