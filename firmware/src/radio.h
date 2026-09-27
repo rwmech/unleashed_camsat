@@ -65,7 +65,9 @@ public:
     // For the console and STATUS.
     uint32_t ringDrops() const;
     uint32_t sendFails() const;
-    bool     slowRate() const;
+    bool     slowRate(const ulink::Mac& m) const;   // m at 1 Mbps
+    // fastAgain: m's link came up, so try 24 Mbps at once.
+    void     fastAgain(const ulink::Mac& m);
     void     mac(uint8_t out[6]) const;
 };
 

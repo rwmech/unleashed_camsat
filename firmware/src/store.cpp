@@ -64,21 +64,53 @@ bool begin() {
     return nvs_open(kNs, NVS_READWRITE, &g_nvs) == ESP_OK;
 }
 
-bool loadPairing(uint8_t mac[6], uint8_t key[16]) {
-    size_t n = 6;
-    if (!g_nvs || nvs_get_blob(g_nvs, "host", mac, &n) != ESP_OK || n != 6) return false;
+// The boards in NVS, versioned like the settings.
+struct Boards {
+    uint8_t  ver = 2;
+    uint8_t  n = 0;
+    store::BoardRec b[store::kBoards] = {};
+};
+
+uint8_t loadBoards(BoardRec out[kBoards]) {
+    if (!g_nvs) return 0;
+    Boards v;
+    size_t n = sizeof(v);
+    if (nvs_get_blob(g_nvs, "boards", &v, &n) == ESP_OK && n == sizeof(v) && v.ver == 2 && v.n <= kBoards) {
+        memcpy(out, v.b, sizeof(v.b));
+        const uint8_t k = v.n;
+        memset(&v, 0, sizeof(v));
+        return k;
+    }
+    // Before 1.2.0: one board, under "host" and "key".
+    BoardRec& r = out[0];
+    memset(&r, 0, sizeof(r));
+    n = 6;
+    if (nvs_get_blob(g_nvs, "host", r.mac, &n) != ESP_OK || n != 6) return 0;
     n = 16;
-    return nvs_get_blob(g_nvs, "key", key, &n) == ESP_OK && n == 16;
+    if (nvs_get_blob(g_nvs, "key", r.key, &n) != ESP_OK || n != 16) { memset(&r, 0, sizeof(r)); return 0; }
+    r.ord = 0;
+    r.recv = 3;                                        // RECV_ALL: it had every picture
+    return 1;
 }
 
-bool savePairing(const uint8_t mac[6], const uint8_t key[16]) {
-    if (!g_nvs) return false;
-    return nvs_set_blob(g_nvs, "host", mac, 6) == ESP_OK && nvs_set_blob(g_nvs, "key", key, 16) == ESP_OK &&
-           nvs_commit(g_nvs) == ESP_OK;
+bool saveBoards(const BoardRec* b, uint8_t n) {
+    if (!g_nvs || n > kBoards) return false;
+    Boards v;
+    v.n = n;
+    memcpy(v.b, b, sizeof(BoardRec) * n);
+    const bool ok = nvs_set_blob(g_nvs, "boards", &v, sizeof(v)) == ESP_OK && nvs_commit(g_nvs) == ESP_OK;
+    memset(&v, 0, sizeof(v));
+    // The one-board keys go once the new form is written, and only then: a
+    // full partition must not lose the pairing (code review).
+    if (!ok) return false;
+    nvs_erase_key(g_nvs, "host");
+    nvs_erase_key(g_nvs, "key");
+    return nvs_commit(g_nvs) == ESP_OK;
 }
 
 void forget() {
     if (!g_nvs) return;
+    nvs_erase_key(g_nvs, "boards");
     nvs_erase_key(g_nvs, "host");
     nvs_erase_key(g_nvs, "key");
     nvs_erase_key(g_nvs, "set");

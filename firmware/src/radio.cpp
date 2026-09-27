@@ -62,13 +62,31 @@ std::atomic<uint8_t>  g_streak{ 0 };         // MAC failures in a row
 uint32_t              g_sentAt = 0;
 uint8_t               g_chan = 1;
 
-// The rate to the board.
+// The rate to each board, one entry a board. With one entry for the whole
+// radio, sending to two boards in turn reset the rate at every change of
+// destination, so a fallback to 1 Mbps never held. The loop owns the table;
+// the send callback only counts into an entry's streak.
 constexpr uint8_t  kSlowAfter  = 3;          // failures in a row
 constexpr uint32_t kFastAgain  = 30000;      // ms clean at 1 Mbps
-bool     g_slow = false;
-uint32_t g_slowSince = 0;
-uint8_t  g_rateMac[6] = {};
-bool     g_rateSet = false;
+constexpr uint8_t  kRates      = 6;          // the five boards, and one spare
+struct Rate {
+    uint8_t  mac[6];
+    bool     used;
+    bool     applied;                        // this entry's rate is on the peer
+    bool     slow;
+    uint32_t slowSince;
+    uint32_t lastUse;
+    std::atomic<uint8_t> streak;
+};
+Rate g_rate[kRates];
+
+// rateFind: the entry for mac, or nullptr. Safe from the send callback: an
+// entry's mac changes only when the loop reuses it for a new board.
+Rate* rateFind(const uint8_t* mac) {
+    for (Rate& r : g_rate)
+        if (r.used && !memcmp(r.mac, mac, 6)) return &r;
+    return nullptr;
+}
 
 const uint8_t kBroadcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
@@ -92,8 +110,11 @@ void onSent(const uint8_t* mac, esp_now_send_status_t status) {
     if (status != ESP_NOW_SEND_SUCCESS) {
         g_fails.fetch_add(1);
         if (unicast && g_streak.load() < 255) g_streak.fetch_add(1);
+        if (Rate* r = unicast ? rateFind(mac) : nullptr)
+            if (r->streak.load() < 255) r->streak.fetch_add(1);
     } else if (unicast) {
         g_streak.store(0);
+        if (Rate* r = rateFind(mac)) r->streak.store(0);
     }
     g_busy.store(false);
 }
@@ -105,28 +126,48 @@ void applyRate(const uint8_t* mac, bool slow) {
     if (esp_now_set_peer_rate_config(mac, &rc) != ESP_OK) ESP_LOGW(TAG, "rate not set");
 }
 
+// rateEntry: mac's entry, taking a free one or the one used longest ago.
+Rate& rateEntry(const uint8_t* mac, uint32_t now) {
+    if (Rate* r = rateFind(mac)) return *r;
+    Rate* pick = &g_rate[0];
+    for (Rate& r : g_rate) {
+        if (!r.used) { pick = &r; break; }
+        if (now - r.lastUse > now - pick->lastUse) pick = &r;
+    }
+    pick->used = false;                          // the callback stops matching the old board
+    memcpy(pick->mac, mac, 6);
+    pick->applied = false;
+    pick->slow = false;
+    pick->slowSince = 0;
+    pick->streak.store(0);
+    pick->used = true;
+    return *pick;
+}
+
 // rateCheck: before each unicast, fall back or come back as the streak says.
 void rateCheck(const uint8_t* mac) {
     const uint32_t now = nowMs();
-    if (!g_rateSet || memcmp(g_rateMac, mac, 6)) {
-        memcpy(g_rateMac, mac, 6);
-        g_rateSet = true;
-        g_slow = false;
-        g_streak.store(0);
+    Rate& r = rateEntry(mac, now);
+    r.lastUse = now;
+    if (!r.applied) {
+        r.applied = true;
+        r.slow = false;
+        r.streak.store(0);
         applyRate(mac, false);
         return;
     }
-    if (!g_slow && g_streak.load() >= kSlowAfter) {
-        g_slow = true;
-        g_slowSince = now;
+    const uint8_t streak = r.streak.load();
+    if (!r.slow && streak >= kSlowAfter) {
+        r.slow = true;
+        r.slowSince = now;
         applyRate(mac, true);
-        ESP_LOGI(TAG, "%u failures in a row: 1 Mbps", static_cast<unsigned>(g_streak.load()));
-    } else if (g_slow && g_streak.load() == 0 && now - g_slowSince >= kFastAgain) {
-        g_slow = false;
+        ESP_LOGI(TAG, "%u failures in a row to %02x:%02x: 1 Mbps", static_cast<unsigned>(streak), mac[4], mac[5]);
+    } else if (r.slow && streak == 0 && now - r.slowSince >= kFastAgain) {
+        r.slow = false;
         applyRate(mac, false);
-        ESP_LOGI(TAG, "clean for 30 s: 24 Mbps again");
-    } else if (g_slow && g_streak.load()) {
-        g_slowSince = now;                       // not clean yet
+        ESP_LOGI(TAG, "clean for 30 s to %02x:%02x: 24 Mbps again", mac[4], mac[5]);
+    } else if (r.slow && streak) {
+        r.slowSince = now;                       // not clean yet
     }
 }
 
@@ -138,7 +179,8 @@ bool ensurePeer(const uint8_t* mac) {
     p.ifidx = WIFI_IF_STA;
     p.encrypt = false;                           // the link seals for itself
     const esp_err_t e = esp_now_add_peer(&p);
-    if (e == ESP_OK && memcmp(mac, kBroadcast, 6)) g_rateSet = false;   // a new entry has the default rate
+    if (e == ESP_OK && memcmp(mac, kBroadcast, 6))
+        if (Rate* r = rateFind(mac)) r->applied = false;   // a new peer entry has the default rate
     return e == ESP_OK || e == ESP_ERR_ESPNOW_EXIST;
 }
 
@@ -216,6 +258,9 @@ bool SatRadio::addPeer(const ulink::Mac& m) { return ensurePeer(m.b); }
 
 void SatRadio::delPeer(const ulink::Mac& m) {
     if (esp_now_is_peer_exist(m.b)) esp_now_del_peer(m.b);
+    // Its rate entry goes too: nothing is sent to it again, so a slow entry
+    // would never clear, and it would hold a slot.
+    if (Rate* r = rateFind(m.b)) r->used = false;
 }
 
 uint8_t SatRadio::macFailStreak() { return g_streak.load(); }
@@ -224,7 +269,25 @@ uint32_t SatRadio::heapFree() { return static_cast<uint32_t>(esp_get_free_heap_s
 
 uint32_t SatRadio::ringDrops() const { return g_drops.load(); }
 uint32_t SatRadio::sendFails() const { return g_fails.load(); }
-bool     SatRadio::slowRate() const { return g_slow; }
+bool SatRadio::slowRate(const ulink::Mac& m) const {
+    const Rate* r = rateFind(m.b);
+    return r && r->slow;
+}
+
+// fastAgain: a board whose link has just come up (its PONG came back) is
+// tried at 24 Mbps at once rather than 30 s from now. A probe, not a proof:
+// the PING went at 1 Mbps. After a reset the board was away, not the path
+// bad, and holding 1 Mbps sent the first picture at about 49 KB/s; a path
+// that is really marginal falls back again within about a second (three
+// failed resends), the same probe the 30 s timer makes.
+void SatRadio::fastAgain(const ulink::Mac& m) {
+    Rate* r = rateFind(m.b);
+    if (!r || !r->slow || !r->applied) return;
+    r->slow = false;
+    r->streak.store(0);
+    applyRate(m.b, false);
+    ESP_LOGI(TAG, "%02x:%02x is back: 24 Mbps", m.b[4], m.b[5]);
+}
 void     SatRadio::mac(uint8_t out[6]) const { esp_read_mac(out, ESP_MAC_WIFI_STA); }
 
 int rngMbed(void*, unsigned char* out, size_t n) {

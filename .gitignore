@@ -8,3 +8,4 @@ firmware/managed_components/
 firmware/dependencies.lock
 *.pyc
 __pycache__/
+firmware/test/test_sched

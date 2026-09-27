@@ -72,7 +72,20 @@ Pairing needs you at both ends, inside a two-minute window. Nothing pairs from t
 
 From then on the satellite finds its board by itself after every power cut, and follows it if the router changes channel.
 
-**Starting again:** hold IO0 (the button on the MB board) for 5 seconds while the satellite is running. It forgets its pairing and restarts, ready to pair. Holding IO0 while powering up does something else: that is the ESP32's flashing mode.
+**Starting again:** hold IO0 (the button on the MB board) for 5 seconds while the satellite is running. It forgets every board it is paired with and restarts, ready to pair. Holding IO0 while powering up does something else: that is the ESP32's flashing mode.
+
+## One satellite, several boards
+
+A satellite pairs with up to **five boards**, each with a key of its own, so no board can read another's pictures.
+
+- The first board it paired with **owns** it: that board's camera settings (`CONFIG camsat`) are the ones it runs. The others choose only what they receive.
+- To add a board, the owner's sysop types `LINK SHARE n` (n from `LINK`): the satellite takes one more board for 2 minutes. On the new board, `LINK PAIR` as usual. Its LED double-blinks while it is open.
+- **Every board sharing a satellite must be on the same Wi-Fi channel**, which usually means the same router. A board on another channel is told so when it tries to pair, and a board whose router moves later is shown as not heard to the others; the satellite stays with the boards it can hear.
+- A caller's `SNAPSHOT` goes to the board they called; requests wait their turn, two a board and eight in all, and a caller is told how many are ahead when the queue is full.
+- A timelapse or motion picture is taken once and sent to each board that wants it (`CONFIG sats` on each board: Receive timelapse, Receive motion). An awake satellite keeps its own timelapse clock; it is the owner's interval.
+- A board lets the satellite go with `LINK FORGET n`. The owner can take another board off with `LINK REVOKE n board`; that board is told.
+
+Awake time per picture grows with the boards it goes to: about 0.9 s on the link for each after the first.
 
 ## On the board
 
@@ -83,7 +96,9 @@ Each paired satellite is a camera in the board's own camera list, under the name
 | `SNAPSHOT [n\|name]` | callers (as the sysop sets) | take a photo with the default camera, or camera `n` or `name` |
 | `CAMERA` | staff | every camera on the board: up, busy or down, and what each is doing |
 | `CAMERA <n\|name>` | staff | one satellite: the link and its signal, the sensor, memory, uptime, photos taken |
-| `LINK` | staff | every paired device on the link |
+| `SATS [n]` | callers (as the sysop sets) | the satellites: the number `SNAPSHOT` takes, name, awake or asleep, last picture. Staff also see the radio, and `SATS n` one in full |
+| `LINK` | staff | every paired device on the link, and the boards sharing each |
+| `CONFIG sats` | sysop | each satellite: its name, its camera number, and what it sends to this board |
 | `CONFIG cameras` | sysop | which camera `SNAPSHOT` uses when none is named |
 | `CONFIG camsat` | sysop | size, quality, names, watermark, flash, timelapse, motion, picture settings, deep sleep |
 
@@ -93,7 +108,7 @@ Photos land in the Photos area (FILES), named like a built-in camera's: `SNAP-20
 
 Callers get one allowance across every camera on the board: 10 photos an hour and 20 a day each, the sysop exempt.
 
-This needs µnleashed BBS 1.2.0 or later, which carries the link and the camera list.
+This needs µnleashed BBS 1.2.0 or later, which carries the link and the camera list. A satellite on this firmware still works with a board from before sharing: that board is its only one, and gets every picture.
 
 ## How it works
 

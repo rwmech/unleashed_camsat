@@ -5,11 +5,16 @@
 // File:         firmware/src/main.cpp
 // Module:       The satellite
 //
-// Purpose:      Pairs with a µnleashed board, keeps the link up, and takes a
-//               picture whenever the board sends SNAP: for a caller, for the
-//               board's timelapse, or because this satellite's motion sensor
-//               or its own timer asked (EVENT; the board answers with SNAP,
-//               so the board names, dates and limits every picture).
+// Purpose:      Pairs with up to five µnleashed boards (1.2.0), keeps the
+//               link up, and takes a picture whenever a board sends SNAP:
+//               for a caller, or because this satellite's motion sensor or
+//               its timer asked (EVENT; each board that wants that kind
+//               answers with SNAP, so the board names, dates and limits
+//               every picture). A caller's SNAP waits in a queue while the
+//               camera works (satsched.h: two a board, eight in all, in turn);
+//               an EVENT's picture is taken once and sent to every board
+//               that answered. The first board paired owns the satellite:
+//               its camera settings are the ones used.
 //
 //               Two tasks. The link task (core 1) owns the engine: every
 //               engine call is its. The camera task (core 0, below the
@@ -66,6 +71,7 @@
 #include "link.h"
 #include "linkfam.h"
 #include "radio.h"
+#include "satsched.h"
 #include "store.h"
 
 using namespace ulink;
@@ -123,30 +129,48 @@ uint8_t     g_lastErr = 0;
 uint32_t    g_statusAt = 0;
 uint32_t    g_bootMs = 0;
 
-// The one picture in hand. The link task owns every field but the phase,
-// which the camera task moves from Taking to Ready or Failed.
+// What each board wants delivered (RECV_*), by the engine's slot for it,
+// with RECV_SAID once the board has said: a board from before 1.2.0 never
+// does, keeps its own timelapse clock, and so is not asked by this one's
+// (code review: it took every timelapse twice).
+uint8_t     g_recv[Engine::kHosts];
+uint32_t    g_shareUntil = 0;             // an owner's share window, for the LED
+
+// The one picture in hand, and the boards it goes to: one for a caller's
+// SNAP, every board that answered for an EVENT's. The link task owns every
+// field but the phase, which the camera task moves from Taking to Ready or
+// Failed. Sending goes board by board (cur); each is a transfer of its own,
+// sealed with that board's key.
 enum : uint8_t { P_IDLE, P_TAKING, P_READY, P_FAILED, P_SENDING };
 struct Job {
     std::atomic<uint8_t> ph{ P_IDLE };
-    uint16_t sess = 0;
-    uint16_t req = 0;
-    uint8_t  reason = 0;
-    bool     ours = false;                // a session this satellite opened (EVENT)
+    sched::Req to[sched::kBoards];
+    uint8_t  n = 0;
+    uint8_t  cur = 0;
+    uint16_t sess = 0;                    // the board being sent to now: to[cur]'s
+    bool     group = false;               // an EVENT's picture (g_group), not a queued SNAP's
     SnapReq  r;
     Pic      pic;
 };
 Job g_job;
 TaskHandle_t g_camTask = nullptr;
+sched::Queue g_q;                         // callers' SNAPs waiting for the camera
+sched::Group g_group;                     // the EVENT being answered
 
 // Waking and sleeping
 uint8_t  g_wakeKind = 0;                  // CEV_* the wake is for, 0 none
 bool     g_wakeSent = false;
+uint32_t g_firstUpAt = 0;                 // the first board up this wake
 uint32_t g_quietSince = 0;                // nothing to do since, for sleep
 uint32_t g_motionAt = 0;                  // the last motion EVENT
 bool     g_motionWas = false;
 uint32_t g_forgetFrom = 0;
-uint16_t g_eventSess = 0;                 // an EVENT waiting for the board's SNAP
-uint32_t g_eventAt = 0;
+uint32_t g_tlNextMs = 0;                  // awake: the next timelapse EVENT (1.2.0)
+// An EVENT the camera was too busy to send: tried again as soon as it is
+// free, for up to 10 s, so a visitor during another board's picture is not
+// lost (code review).
+uint8_t  g_pendKind = 0;
+uint32_t g_pendAt = 0;
 
 // Across deep sleep, on the RTC clock (esp_timer starts again at each wake,
 // the RTC clock keeps counting through sleep): the last motion EVENT, so the
@@ -210,17 +234,37 @@ void camTask(void*) {
 // ---------------------------------------------------------------------------
 // Messages to the board
 // ---------------------------------------------------------------------------
-void sendFail(uint16_t sess, uint16_t req, uint8_t code) {
-    uint8_t b[3];
-    put16(b, req);
-    b[2] = code;
-    g_lastErr = code;
-    g_eng->send(0, sess, FAM_CAMERA, CAM_SNAP_FAIL, b, sizeof(b));
+// saveBoards: every board this satellite is paired with, as the engine holds
+// them, to NVS (a pairing, an unpairing, a board's wants changing).
+void saveBoards() {
+    store::BoardRec b[store::kBoards] = {};
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < Engine::kHosts && n < store::kBoards; ++i) {
+        if (!g_eng->peerUsed(i)) continue;
+        store::BoardRec& r = b[n++];
+        memcpy(r.mac, g_eng->peerMac(i).b, 6);
+        memcpy(r.key, g_eng->peerKey(i), 16);
+        r.ord = g_eng->peerOrd(i);
+        r.recv = g_recv[i];
+        snprintf(r.name, sizeof(r.name), "%s", g_eng->peerName(i));
+    }
+    store::saveBoards(b, n);
+    memset(b, 0, sizeof(b));
 }
 
+// sendFail: SNAP_FAIL to one board. place, for CE_BUSY, is the requests
+// ahead (sched::kFull when the queue is full); 0 leaves the byte off.
+void sendFail(uint8_t board, uint16_t sess, uint16_t req, uint8_t code, uint8_t place = 0) {
+    uint8_t b[4];
+    put16(b, req);
+    b[2] = code;
+    b[3] = place;
+    if (code != CE_BUSY) g_lastErr = code;
+    g_eng->send(board, sess, FAM_CAMERA, CAM_SNAP_FAIL, b, code == CE_BUSY ? 4 : 3);
+}
+
+// sendStatus: STATUS to every board that is up, each on a session of its own.
 void sendStatus() {
-    const uint16_t sess = g_eng->openSession(0, FAM_CAMERA);
-    if (!sess) return;
     uint8_t b[28] = {};
     b[0] = cam::sensor()[0] ? 1 : 0;
     b[1] = cam::maxSize();
@@ -229,11 +273,19 @@ void sendStatus() {
     put32(b + 10, ms() / 1000);
     b[14] = g_lastErr;
     snprintf(reinterpret_cast<char*>(b + 16), 12, "%s", cam::sensor());
-    g_eng->send(0, sess, FAM_CAMERA, CAM_STATUS, b, sizeof(b));
-    g_eng->closeAfter(0, sess);
+    for (uint8_t i = 0; i < Engine::kHosts; ++i) {
+        if (!g_eng->hostUp(i)) continue;
+        const uint16_t sess = g_eng->openSession(i, FAM_CAMERA);
+        if (!sess) continue;
+        g_eng->send(i, sess, FAM_CAMERA, CAM_STATUS, b, sizeof(b));
+        g_eng->closeAfter(i, sess);
+    }
 }
 
-void sendSettingsOk(uint16_t sess) {
+// sendSettingsOk: the settings as this satellite runs them (the owner's), to
+// one board: byte 21 what that board wants, byte 22 whether it is the owner,
+// and that this satellite drives its own timelapse by EVENT.
+void sendSettingsOk(uint8_t board, uint16_t sess) {
     uint8_t b[24] = {};
     const SatSettings& s = g_set;
     put16(b, s.tlMin);
@@ -255,25 +307,41 @@ void sendSettingsOk(uint16_t sess) {
     b[18] = s.pic.levels;
     b[19] = s.pic.gamma;
     b[20] = s.motion ? s.motionPin : 0xFF;
-    g_eng->send(0, sess, FAM_CAMERA, CAM_SETTINGS_OK, b, sizeof(b));
+    b[21] = static_cast<uint8_t>((g_recv[board] & RECV_ALL) | RECV_SAID);
+    b[22] = static_cast<uint8_t>((static_cast<int>(board) == g_eng->ownerIndex() ? SO_OWNER : 0) | SO_EVENTS);
+    g_eng->send(board, sess, FAM_CAMERA, CAM_SETTINGS_OK, b, sizeof(b));
 }
 
-// event: ask the board for a picture (motion or this satellite's timer).
-bool sendEvent(uint8_t kind) {
-    if (g_job.ph.load() != P_IDLE) return false;
-    const uint16_t sess = g_eng->openSession(0, FAM_CAMERA);
-    if (!sess) return false;
+// sendEvent: ask for a picture (motion, or the timelapse), to every board
+// that is up and wants that kind. Each that answers with a SNAP gets the
+// same picture (loop: g_group). True when it went, or when no board wants
+// one (nothing to wait for). saidOnly: only boards from 1.2.0 on (the awake
+// timelapse clock; an older board runs its own).
+bool sendEvent(uint8_t kind, bool saidOnly = false) {
+    if (g_job.ph.load() != P_IDLE || g_group.active()) return false;
+    const uint32_t now = ms();
+    g_group.begin(kind, now);
     uint8_t b[5];
     b[0] = kind;
     put32(b + 1, unixNow());
-    if (g_eng->send(0, sess, FAM_CAMERA, CAM_EVENT, b, sizeof(b)) != 1) {
-        g_eng->closeSession(0, sess);
-        return false;
+    uint8_t asked = 0;
+    for (uint8_t i = 0; i < Engine::kHosts; ++i) {
+        if (!g_eng->hostUp(i) || !sched::wants(g_recv[i], kind)) continue;
+        if (saidOnly && !(g_recv[i] & RECV_SAID)) continue;
+        const uint16_t sess = g_eng->openSession(i, FAM_CAMERA);
+        if (!sess) continue;
+        if (g_eng->send(i, sess, FAM_CAMERA, CAM_EVENT, b, sizeof(b)) != 1) { g_eng->closeSession(i, sess); continue; }
+        g_group.asked(i, sess);
+        ++asked;
     }
-    ESP_LOGI(TAG, "asked the board for a %s picture", kind == CEV_MOTION ? "motion" : "timelapse");
-    g_eventSess = sess;
-    g_eventAt = ms();
-    g_quietSince = g_eventAt;
+    if (!asked) {
+        g_group.end();
+        ESP_LOGI(TAG, "no board wants a %s picture", kind == CEV_MOTION ? "motion" : "timelapse");
+        return true;
+    }
+    ESP_LOGI(TAG, "asked %u board%s for a %s picture", asked, asked == 1 ? "" : "s",
+             kind == CEV_MOTION ? "motion" : "timelapse");
+    g_quietSince = now;
     return true;
 }
 
@@ -302,134 +370,236 @@ void motionPinSetup() {
     gpio_set_pull_mode(g, GPIO_PULLDOWN_ONLY);
 }
 
-void onSettings(uint16_t sess, const uint8_t* p, size_t n) {
-    if (n < 21) return;
-    SatSettings s = g_set;
-    s.tlMin = get16(p);
-    s.tlSec = p[2];
-    s.motion = p[3] != 0;
-    s.holdoffS = get16(p + 4);
-    s.pic.size = p[6];
-    s.pic.quality = p[7];
-    s.pic.flash = p[8];
-    s.sleep = p[9] != 0;
-    s.pic.flip = p[10] != 0;
-    s.pic.mirror = p[11] != 0;
-    s.pic.bright = static_cast<int8_t>(p[12]);
-    s.pic.contrast = static_cast<int8_t>(p[13]);
-    s.pic.sat = static_cast<int8_t>(p[14]);
-    s.pic.exposure = static_cast<int8_t>(p[15]);
-    s.pic.wb = p[16];
-    s.pic.effect = p[17];
-    s.pic.levels = p[18] != 0;
-    s.pic.gamma = p[19];
-    if (p[20] != 0xFF) s.motionPin = p[20];
-    clampSettings(s);
-    const bool changed = memcmp(&s, &g_set, sizeof(s)) != 0;
-    g_set = s;
-    if (changed) {
-        store::saveSettings(g_set);
-        motionPinSetup();
-        ESP_LOGI(TAG, "settings: %s q%u flash %u, timelapse %u:%02u, motion %s (pin %u, %u s), %s",
-                 g_set.pic.size == CS_UXGA ? "uxga" : g_set.pic.size == CS_SXGA ? "sxga" : g_set.pic.size == CS_XGA ? "xga"
-                 : g_set.pic.size == CS_SVGA ? "svga" : g_set.pic.size == CS_VGA ? "vga" : "small",
-                 g_set.pic.quality, g_set.pic.flash, g_set.tlMin, g_set.tlSec, g_set.motion ? "on" : "off",
-                 g_set.motionPin, g_set.holdoffS, g_set.sleep ? "deep sleep between pictures" : "awake");
+// onSettings: SETTINGS from a board. What it wants delivered (byte 21) is
+// every board's own; the camera settings (bytes 0 to 20) are taken only from
+// the owner, so two boards cannot fight over one camera. Every board is
+// answered with the settings the satellite runs.
+void onSettings(uint8_t board, uint16_t sess, const uint8_t* p, size_t n) {
+    if (n < 21 || board >= Engine::kHosts) return;
+    if (n >= 22 && (p[21] & RECV_SAID)) {
+        const uint8_t want = static_cast<uint8_t>((p[21] & RECV_ALL) | RECV_SAID);
+        if (want != g_recv[board]) {
+            g_recv[board] = want;
+            saveBoards();
+            ESP_LOGI(TAG, "\"%s\" wants %s", g_eng->peerName(board),
+                     (want & RECV_ALL) == RECV_ALL ? "timelapse and motion"
+                     : (want & RECV_ALL) == RECV_TIMELAPSE ? "timelapse only"
+                     : (want & RECV_ALL) == RECV_MOTION ? "motion only" : "no timed pictures");
+        }
     }
-    sendSettingsOk(sess);
-    g_eng->closeAfter(0, sess);
+    if (static_cast<int>(board) == g_eng->ownerIndex()) {
+        SatSettings s = g_set;
+        s.tlMin = get16(p);
+        s.tlSec = p[2];
+        s.motion = p[3] != 0;
+        s.holdoffS = get16(p + 4);
+        s.pic.size = p[6];
+        s.pic.quality = p[7];
+        s.pic.flash = p[8];
+        s.sleep = p[9] != 0;
+        s.pic.flip = p[10] != 0;
+        s.pic.mirror = p[11] != 0;
+        s.pic.bright = static_cast<int8_t>(p[12]);
+        s.pic.contrast = static_cast<int8_t>(p[13]);
+        s.pic.sat = static_cast<int8_t>(p[14]);
+        s.pic.exposure = static_cast<int8_t>(p[15]);
+        s.pic.wb = p[16];
+        s.pic.effect = p[17];
+        s.pic.levels = p[18] != 0;
+        s.pic.gamma = p[19];
+        if (p[20] != 0xFF) s.motionPin = p[20];
+        clampSettings(s);
+        const bool changed = memcmp(&s, &g_set, sizeof(s)) != 0;
+        const bool tlChanged = s.tlMin != g_set.tlMin || s.tlSec != g_set.tlSec || s.sleep != g_set.sleep;
+        g_set = s;
+        if (tlChanged) g_tlNextMs = 0;                 // the awake timer starts again from now
+        if (changed) {
+            store::saveSettings(g_set);
+            motionPinSetup();
+            ESP_LOGI(TAG, "settings: %s q%u flash %u, timelapse %u:%02u, motion %s (pin %u, %u s), %s",
+                     g_set.pic.size == CS_UXGA ? "uxga" : g_set.pic.size == CS_SXGA ? "sxga" : g_set.pic.size == CS_XGA ? "xga"
+                     : g_set.pic.size == CS_SVGA ? "svga" : g_set.pic.size == CS_VGA ? "vga" : "small",
+                     g_set.pic.quality, g_set.pic.flash, g_set.tlMin, g_set.tlSec, g_set.motion ? "on" : "off",
+                     g_set.motionPin, g_set.holdoffS, g_set.sleep ? "deep sleep between pictures" : "awake");
+        }
+    }
+    sendSettingsOk(board, sess);
+    g_eng->closeAfter(board, sess);
 }
 
-void onSnap(uint16_t sess, const uint8_t* p, size_t n) {
-    if (n < 6) return;
-    const uint16_t req = get16(p);
-    if (g_job.ph.load() != P_IDLE) { sendFail(sess, req, CE_BUSY); g_eng->closeAfter(0, sess); return; }
-    Job& j = g_job;
-    j.r = SnapReq();
-    j.r.size = p[2];
-    j.r.quality = p[3];
-    j.r.flash = p[4];
-    j.reason = p[5];
-    if (n >= 67) {
-        j.r.mark = p[6] != 0;
-        text(j.r.board, sizeof(j.r.board), p + 7, 20);
-        text(j.r.when, sizeof(j.r.when), p + 27, 16);
-        text(j.r.who, sizeof(j.r.who), p + 43, 24);
-        text(j.r.comment, sizeof(j.r.comment), p + 67, n - 67);
+// onSnap: a board asks for a picture. The answer to this satellite's EVENT
+// joins the group (one picture for every board that answers); anything else
+// waits its turn in the queue, or is told how many are ahead.
+void onSnap(uint8_t board, uint16_t sess, const uint8_t* p, size_t n) {
+    if (n < 6 || board >= Engine::kHosts) return;
+    if (g_group.answer(board, sess, p, n, ms())) return;
+    uint8_t place = 0;
+    if (!g_q.add(board, sess, p, n, place)) {
+        sendFail(board, sess, get16(p), CE_BUSY, place);
+        g_eng->closeAfter(board, sess);
+        ESP_LOGI(TAG, "SNAP from \"%s\" refused: %s", g_eng->peerName(board),
+                 place == sched::kFull ? "the queue is full" : "that board has two waiting");
     }
-    if (sess == g_eventSess) g_eventSess = 0;
-    j.sess = sess;
-    j.req = req;
-    j.ours = sess & 0x8000;
-    j.ph.store(P_TAKING);
-    g_led = Led::Busy;
-    xTaskNotifyGive(g_camTask);
-    ESP_LOGI(TAG, "SNAP %u for %s", static_cast<unsigned>(req), j.r.who[0] ? j.r.who : "the board");
 }
 
-bool evMessage(void*, uint8_t, uint16_t sess, uint8_t family, uint8_t type, const uint8_t* p, size_t n) {
+bool evMessage(void*, uint8_t board, uint16_t sess, uint8_t family, uint8_t type, const uint8_t* p, size_t n) {
     if (family != FAM_CAMERA) return true;
-    if (type == CAM_SNAP) onSnap(sess, p, n);
-    else if (type == CAM_SETTINGS) onSettings(sess, p, n);
+    if (type == CAM_SNAP) onSnap(board, sess, p, n);
+    else if (type == CAM_SETTINGS) onSettings(board, sess, p, n);
     g_quietSince = ms();
     return true;
 }
 
+// parseSnap: a SNAP's bytes into what the camera is told. The size,
+// quality and flash are the owner's to choose: another board's SNAP takes
+// the settings (the owner's) rather than lighting the owner's flash
+// (code review).
+void parseSnap(const sched::Req& q, SnapReq& r) {
+    r = SnapReq();
+    const uint8_t* p = q.p;
+    const bool owner = static_cast<int>(q.board) == g_eng->ownerIndex();
+    r.size = owner ? p[2] : 0;
+    r.quality = owner ? p[3] : 0;
+    r.flash = owner ? p[4] : 0xFF;
+    if (q.n >= 67) {
+        r.mark = p[6] != 0;
+        text(r.board, sizeof(r.board), p + 7, 20);
+        text(r.when, sizeof(r.when), p + 27, 16);
+        text(r.who, sizeof(r.who), p + 43, 24);
+        text(r.comment, sizeof(r.comment), p + 67, q.n - 67);
+    }
+}
+
+// startJob: take one picture for the boards in to[0..n): the first one's
+// words go on it (for an EVENT's, the owner's when it answered).
+void startJob(const sched::Req* to, uint8_t n, bool group) {
+    Job& j = g_job;
+    j.group = group;
+    for (uint8_t i = 0; i < n; ++i) j.to[i] = to[i];
+    j.n = n;
+    j.cur = 0;
+    j.sess = to[0].sess;
+    parseSnap(to[0], j.r);
+    j.ph.store(P_TAKING);
+    g_led = Led::Busy;
+    xTaskNotifyGive(g_camTask);
+    ESP_LOGI(TAG, "SNAP %u for %s, %u board%s", static_cast<unsigned>(to[0].req),
+             j.r.who[0] ? j.r.who : "the board", n, n == 1 ? "" : "s");
+}
+
+// jobDone: every board's session is let go here (the engine keeps one the
+// far end has finished with for two minutes, and its table holds 16: the
+// bench, 2026-09-26), and the next request can go.
 void jobDone() {
-    // Every picture's session is let go here, the board's as well as ours:
-    // the engine keeps a session the far end has finished with for two
-    // minutes, and its table holds 16, so a 10 s timelapse filled it in
-    // 160 s and every SNAP after that was refused (the bench, 2026-09-26).
-    if (g_job.sess) g_eng->closeAfter(0, g_job.sess);
-    g_job.ph.store(P_IDLE);
+    Job& j = g_job;
+    for (uint8_t i = 0; i < j.n; ++i)
+        if (j.to[i].sess) g_eng->closeAfter(j.to[i].board, j.to[i].sess);
+    j.n = 0;
+    j.cur = 0;
+    j.sess = 0;
+    if (j.group) g_group.end();                 // its EVENT is answered
+    j.group = false;
+    j.ph.store(P_IDLE);
     g_led = g_eng->hostUp() ? Led::Up : Led::Search;
     g_quietSince = ms();
 }
 
+// nextBoard: the picture has gone to to[cur] (or could not): on to the next
+// board still there, or done.
+void nextBoard() {
+    Job& j = g_job;
+    while (++j.cur < j.n && !j.to[j.cur].sess) {}
+    if (j.cur >= j.n) { jobDone(); return; }
+    j.sess = j.to[j.cur].sess;
+    j.ph.store(P_READY);
+}
+
 uint32_t g_sendAt = 0;
 
-void evBulkSent(void*, uint8_t, uint16_t sess, uint8_t, bool ok) {
-    if (g_job.ph.load() != P_SENDING || sess != g_job.sess) return;
+void evBulkSent(void*, uint8_t board, uint16_t sess, uint8_t, bool ok) {
+    Job& j = g_job;
+    if (j.ph.load() != P_SENDING || j.cur >= j.n || sess != j.sess || board != j.to[j.cur].board) return;
     const uint32_t took = ms() - g_sendAt;
-    const PeerStats& st = g_eng->peerStats(0);
-    ESP_LOGI(TAG, "picture %u %s: %u bytes in %u ms (%u KB/s); link tx %u, retries %u, drops %u; "
+    const PeerStats& st = g_eng->peerStats(board);
+    ESP_LOGI(TAG, "picture %u to \"%s\" %s: %u bytes in %u ms (%u KB/s); link tx %u, retries %u, drops %u; "
                   "radio fails %u%s",
-             static_cast<unsigned>(g_job.req), ok ? "taken by the board" : "not delivered",
-             static_cast<unsigned>(g_job.pic.len), static_cast<unsigned>(took),
-             static_cast<unsigned>(took ? g_job.pic.len / took : 0), static_cast<unsigned>(st.tx),
+             static_cast<unsigned>(j.to[j.cur].req), g_eng->peerName(board), ok ? "taken" : "not delivered",
+             static_cast<unsigned>(j.pic.len), static_cast<unsigned>(took),
+             static_cast<unsigned>(took ? j.pic.len / took : 0), static_cast<unsigned>(st.tx),
              static_cast<unsigned>(st.retries), static_cast<unsigned>(st.drops),
-             static_cast<unsigned>(g_radio.sendFails()), g_radio.slowRate() ? ", at 1 Mbps" : "");
+             static_cast<unsigned>(g_radio.sendFails()), g_radio.slowRate(g_eng->peerMac(board)) ? ", at 1 Mbps" : "");
     if (!ok) g_lastErr = CE_CAPTURE;
-    jobDone();
+    g_eng->closeAfter(board, sess);
+    j.to[j.cur].sess = 0;
+    nextBoard();
 }
 
-void evReset(void*, uint8_t, uint16_t sess, uint8_t, uint8_t reason) {
-    if (sess != g_job.sess) return;
-    const uint8_t ph = g_job.ph.load();
-    if (ph == P_SENDING || ph == P_READY || ph == P_FAILED) {
-        ESP_LOGW(TAG, "the board ended the picture's session (%u)", reason);
-        g_job.ph.store(P_IDLE);
-        g_led = g_eng->hostUp() ? Led::Up : Led::Search;
+void evReset(void*, uint8_t board, uint16_t sess, uint8_t, uint8_t reason) {
+    // A board that gave up on a queued SNAP: not taken for nobody.
+    if (g_q.dropSess(board, sess)) ESP_LOGI(TAG, "\"%s\" gave up a queued SNAP", g_eng->peerName(board));
+    Job& j = g_job;
+    for (uint8_t i = 0; i < j.n; ++i) {
+        if (j.to[i].board != board || j.to[i].sess != sess) continue;
+        ESP_LOGW(TAG, "\"%s\" ended the picture's session (%u)", g_eng->peerName(board), reason);
+        j.to[i].sess = 0;
+        const uint8_t ph = j.ph.load();
+        if (i == j.cur && (ph == P_SENDING || ph == P_READY)) nextBoard();
     }
 }
 
-void evPeerState(void*, uint8_t, bool up) {
-    ESP_LOGI(TAG, "link %s", up ? "up" : "down");
-    if (g_job.ph.load() == P_IDLE) g_led = up ? Led::Up : Led::Search;
+void evPeerState(void*, uint8_t board, bool up) {
+    ESP_LOGI(TAG, "link to \"%s\" %s", g_eng->peerName(board), up ? "up" : "down");
+    if (g_job.ph.load() == P_IDLE) g_led = g_eng->hostUp() ? Led::Up : Led::Search;
     if (up) {
+        g_radio.fastAgain(g_eng->peerMac(board));
         store::setLastChannel(g_radio.channel());
         g_statusAt = 0;                          // STATUS now
-        g_wakeSent = false;
+        if (!g_firstUpAt) g_firstUpAt = ms();
+        return;
+    }
+    // Gone: its waiting SNAPs go, an EVENT does not wait for it, and the
+    // picture being sent skips it (the one on the air now ends by itself).
+    g_q.drop(board, [board](uint16_t s) { g_eng->closeSession(board, s); });
+    g_group.forget(board);
+    Job& j = g_job;
+    for (uint8_t i = 0; i < j.n; ++i)
+        if (j.to[i].board == board && (i != j.cur || j.ph.load() != P_SENDING)) j.to[i].sess = 0;
+}
+
+void evPaired(void*, uint8_t board, const PairInfo& who) {
+    if (board < Engine::kHosts) g_recv[board] = RECV_ALL;
+    saveBoards();
+    const bool first = !g_paired;
+    g_paired = true;
+    g_pairUntil = 0;
+    g_shareUntil = 0;
+    ESP_LOGI(TAG, "paired with \"%s\" %02x:%02x:%02x:%02x:%02x:%02x, code %04u%s", who.name, who.mac.b[0],
+             who.mac.b[1], who.mac.b[2], who.mac.b[3], who.mac.b[4], who.mac.b[5], static_cast<unsigned>(who.code),
+             first ? ": it owns this satellite" : "");
+    g_led = g_eng->hostUp() ? Led::Up : Led::Search;
+}
+
+// A board let this satellite go (UNPAIR), or its owner revoked one.
+void evUnpaired(void*, uint8_t board) {
+    if (board < Engine::kHosts) g_recv[board] = RECV_ALL;
+    g_q.drop(board, [](uint16_t) {});
+    g_group.forget(board);
+    saveBoards();
+    uint8_t left = 0;
+    for (uint8_t i = 0; i < Engine::kHosts; ++i) left += g_eng->peerUsed(i);
+    ESP_LOGW(TAG, "a board let this satellite go; %u left", left);
+    if (!left) {
+        g_paired = false;
+        g_led = Led::Off;
+        ESP_LOGW(TAG, "no board left: hold IO0 for 5 s, or reset, to pair again");
     }
 }
 
-void evPaired(void*, uint8_t, const PairInfo& who) {
-    store::savePairing(who.mac.b, who.key);
-    g_paired = true;
-    g_pairUntil = 0;
-    ESP_LOGI(TAG, "paired with %02x:%02x:%02x:%02x:%02x:%02x, code %04u", who.mac.b[0], who.mac.b[1],
-             who.mac.b[2], who.mac.b[3], who.mac.b[4], who.mac.b[5], static_cast<unsigned>(who.code));
-    g_led = Led::Search;
+// The owner opened this satellite to one more board.
+void evShareOpened(void*, uint32_t secs) {
+    g_shareUntil = ms() + secs * 1000u;
+    g_led = Led::Pairing;
+    ESP_LOGI(TAG, "the owner lets one more board pair for %u s: LINK PAIR on it now", static_cast<unsigned>(secs));
 }
 
 // Pairing: the code, worked out before the sysop answers at the board, so
@@ -452,26 +622,59 @@ void evClock(void*, uint32_t unix) {
 // ---------------------------------------------------------------------------
 // The loop's other duties
 // ---------------------------------------------------------------------------
-// sendPicture: a finished picture goes as one bulk message: the header, then
-// the JPEG, from the buffer the camera wrote.
+// sendPicture: the finished picture to the board it is going to now, as one
+// bulk message: the header (that board's request id and reason), then the
+// JPEG, from the buffer the camera wrote.
 void sendPicture() {
     Job& j = g_job;
+    const sched::Req& to = j.to[j.cur];
     uint8_t* h = j.pic.buf;
     memset(h, 0, cam::kHead);
-    put16(h, j.req);
-    h[2] = j.reason;
+    put16(h, to.req);
+    h[2] = to.reason;
     put16(h + 4, j.pic.w);
     put16(h + 6, j.pic.h);
     put32(h + 8, unixNow());
-    const int r = g_eng->sendBulk(0, j.sess, FAM_CAMERA, CAM_PICTURE, h,
+    const int r = g_eng->sendBulk(to.board, to.sess, FAM_CAMERA, CAM_PICTURE, h,
                                   static_cast<uint32_t>(cam::kHead + j.pic.len));
     if (r == 1) { j.ph.store(P_SENDING); g_sendAt = ms(); return; }
     if (r < 0) {
-        ESP_LOGW(TAG, "the picture could not be queued");
-        sendFail(j.sess, j.req, CE_NOMEM);
-        jobDone();
+        ESP_LOGW(TAG, "the picture could not be queued for \"%s\"", g_eng->peerName(to.board));
+        sendFail(to.board, to.sess, to.req, CE_NOMEM);
+        g_eng->closeAfter(to.board, to.sess);
+        j.to[j.cur].sess = 0;
+        nextBoard();
     }
     // 0: not now, again next pass
+}
+
+// failJob: the camera gave no picture: every board it was for is told.
+void failJob() {
+    Job& j = g_job;
+    for (uint8_t i = 0; i < j.n; ++i)
+        if (j.to[i].sess) sendFail(j.to[i].board, j.to[i].sess, j.to[i].req, j.pic.failCode);
+    jobDone();
+}
+
+// dispatch: with the camera free, the next thing to take: an EVENT's group
+// once its answers are in, else the next SNAP in the queue, in turn.
+void dispatch(uint32_t now) {
+    if (g_job.ph.load() != P_IDLE) return;
+    // Static: the link task's stack is 8 KB and a Req is about 236 bytes.
+    static sched::Req to[sched::kBoards];
+    if (g_group.active()) {
+        if (g_group.ready(now)) {
+            const uint8_t n = g_group.take(g_eng->ownerIndex(), to, [](uint8_t b, uint16_t s) {
+                g_eng->closeSession(b, s);
+            });
+            if (n) { startJob(to, n, true); return; }
+            g_group.end();
+        } else if (g_group.expired(now)) {
+            // Nobody answered: the boards let the EVENT go (hold-off, card).
+            g_group.abandon([](uint8_t b, uint16_t s) { g_eng->closeSession(b, s); });
+        }
+    }
+    if (g_q.next(to[0])) startJob(to, 1, false);
 }
 
 void forgetWatch(uint32_t now) {
@@ -485,7 +688,7 @@ void forgetWatch(uint32_t now) {
     if (!g_forgetFrom) g_forgetFrom = now ? now : 1;
     if (now - g_forgetFrom >= 1000) g_led = Led::Forget;
     if (now - g_forgetFrom >= 5000) {
-        ESP_LOGW(TAG, "IO0 held 5 s: forgetting the pairing and starting again");
+        ESP_LOGW(TAG, "IO0 held 5 s: forgetting every board and starting again");
         store::forget();
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();
@@ -503,11 +706,10 @@ void motionWatch(uint32_t now) {
     const bool rise = high && !g_motionWas;
     g_motionWas = high;
     if (!rise || holdLeftUs()) return;
-    if (sendEvent(CEV_MOTION)) {
-        g_motionAt = now;
-        r_motionUs = rtcUs();
-        r_motionSet = true;
-    }
+    g_motionAt = now;
+    r_motionUs = rtcUs();
+    r_motionSet = true;
+    if (!sendEvent(CEV_MOTION)) { g_pendKind = CEV_MOTION; g_pendAt = now; }
 }
 
 // sleepWatch: with deep sleep on, sleep once nothing is going on: a picture
@@ -564,11 +766,12 @@ void sleepWatch(uint32_t now) {
     if (!tl && !motion) return;                          // nothing would wake it
     const bool cold = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED;
     if (cold && now - g_bootMs < 60000) return;
-    // Awake while the board still owes an answer to the EVENT (its SNAP, or
-    // the 10 s after which the EVENT is let go), while the wake's EVENT has
-    // not gone yet (15 s to find the board), and for 2 s after the last thing
-    // that happened, so a picture's last acknowledgements get out.
-    if (g_eventSess) return;
+    // Awake while a board still owes an answer to the EVENT (its SNAP, or
+    // the 10 s after which the EVENT is let go), while a SNAP waits its turn,
+    // while the wake's EVENT has not gone yet (15 s to find the boards), and
+    // for 2 s after the last thing that happened, so a picture's last
+    // acknowledgements get out.
+    if (g_group.active() || g_q.size() || g_pendKind) return;
     if (g_wakeKind && !g_wakeSent && now - g_bootMs < 15000) return;
     const uint32_t t = ms();                             // not the pass's now: g_quietSince may be newer
     if (static_cast<int32_t>(t - g_quietSince) < 2000) return;
@@ -628,9 +831,8 @@ void linkTask(void*) {
 #endif
         if (ph == P_READY) sendPicture();
         else if (ph == P_FAILED) {
-            sendFail(g_job.sess, g_job.req, g_job.pic.failCode);
             const bool stuck = g_job.pic.stuck;
-            jobDone();
+            failJob();
             if (stuck) {
                 // The sensor answered earlier this boot and cannot be woken:
                 // a restart clears it (the bench, 2026-09-26). The failure
@@ -640,21 +842,43 @@ void linkTask(void*) {
                 esp_restart();
             }
         }
+        // An EVENT the camera was too busy for goes first, so a steady queue
+        // of SNAPs cannot starve it; after 10 s it is let go.
+        if (g_pendKind) {
+            if (static_cast<int32_t>(now - g_pendAt) > 10000) {
+                ESP_LOGW(TAG, "a %s picture was never taken: the camera stayed busy",
+                         g_pendKind == CEV_MOTION ? "motion" : "timelapse");
+                g_pendKind = 0;
+            } else if (g_eng->hostUp() && sendEvent(g_pendKind)) {
+                g_pendKind = 0;
+            }
+        }
+        dispatch(now);
         if (g_eng->hostUp()) {
             if (!g_statusAt || now - g_statusAt >= 60000) { g_statusAt = now; sendStatus(); }
-            if (g_wakeKind && !g_wakeSent) g_wakeSent = sendEvent(g_wakeKind);
+            // The wake's EVENT once every board is up, or 2 s after the first:
+            // they share a channel, so the rest are found at once or not at all.
+            if (g_wakeKind && !g_wakeSent && (g_eng->peersUp() == g_eng->peerCount() ||
+                                              static_cast<int32_t>(now - g_firstUpAt) >= 2000))
+                g_wakeSent = sendEvent(g_wakeKind);
+            // Awake, the timelapse is this satellite's own clock (1.2.0): one
+            // EVENT, one picture for every board that wants it. Before 1.2.0
+            // the board's clock asked, one board, one SNAP.
+            const uint32_t tl = (static_cast<uint32_t>(g_set.tlMin) * 60u + g_set.tlSec) * 1000u;
+            if (tl && !g_set.sleep) {
+                if (!g_tlNextMs) g_tlNextMs = now + tl;
+                else if (static_cast<int32_t>(now - g_tlNextMs) >= 0 && sendEvent(CEV_TIMELAPSE, true)) g_tlNextMs = now + tl;
+            }
+        }
+        if (g_shareUntil && static_cast<int32_t>(now - g_shareUntil) >= 0) {
+            g_shareUntil = 0;
+            if (g_led == Led::Pairing) g_led = g_eng->hostUp() ? Led::Up : Led::Search;
         }
         if (g_pairUntil && now > g_pairUntil) {
             g_eng->stopPairing();
             g_pairUntil = 0;
             g_led = Led::Off;
             ESP_LOGW(TAG, "no board answered in 5 minutes; reset the satellite to pair again");
-        }
-        // Signed: sendEvent, earlier in this pass, stamps g_eventAt after this
-        // pass's now was read (the same wrap the board's timeout had).
-        if (g_eventSess && static_cast<int32_t>(now - g_eventAt) > 10000) {    // the board let the EVENT go
-            g_eng->closeSession(0, g_eventSess);
-            g_eventSess = 0;
         }
         forgetWatch(now);
         motionWatch(now);
@@ -732,6 +956,8 @@ extern "C" void app_main(void) {
     ev.pairAsk = evPairAsk;
     ev.channel = evChannel;
     ev.clock = evClock;
+    ev.unpaired = evUnpaired;
+    ev.shareOpened = evShareOpened;
     static uint8_t win[4 * kPayloadMax];            // a satellite receives no bulk
     g_eng = new Engine(Role::Peer, g_radio, ev, 4, win);
     if (!g_eng->ok()) {
@@ -742,21 +968,27 @@ extern "C" void app_main(void) {
     g_eng->setIdentity(KIND_CAMSAT, CAMSAT_VERSION, 1u << FAM_CAMERA);
     g_eng->setFastRescan(true);
 
-    uint8_t key[16];
-    Mac host;
-    if (store::loadPairing(host.b, key)) {
-        g_eng->addPeer(host, key, KIND_UNKNOWN);
-        g_paired = true;
+    for (uint8_t i = 0; i < Engine::kHosts; ++i) g_recv[i] = RECV_ALL;
+    store::BoardRec boards[store::kBoards];
+    const uint8_t nb = store::loadBoards(boards);
+    for (uint8_t i = 0; i < nb; ++i) {
+        Mac m;
+        memcpy(m.b, boards[i].mac, 6);
+        const int slot = g_eng->addPeer(m, boards[i].key, KIND_UNKNOWN, boards[i].ord,
+                                        boards[i].name[0] ? boards[i].name : nullptr);
+        if (slot >= 0 && slot < Engine::kHosts) g_recv[slot] = static_cast<uint8_t>(boards[i].recv & (RECV_ALL | RECV_SAID));
+        if (slot >= 0) g_paired = true;
+    }
+    memset(boards, 0, sizeof(boards));
+    if (g_paired) {
         g_led = Led::Search;
-        ESP_LOGI(TAG, "paired with %02x:%02x:%02x:%02x:%02x:%02x; looking for it%s", host.b[0], host.b[1],
-                 host.b[2], host.b[3], host.b[4], host.b[5], ch ? " where it was" : "");
+        ESP_LOGI(TAG, "paired with %u board%s; looking for them%s", nb, nb == 1 ? "" : "s", ch ? " where they were" : "");
     } else {
         g_eng->startPairing(KIND_CAMSAT, g_name, CAMSAT_VERSION);
         g_pairUntil = ms() + 5u * 60u * 1000u;
         g_led = Led::Pairing;
         ESP_LOGI(TAG, "not paired: pairing for 5 minutes. On the board: LINK PAIR");
     }
-    memset(key, 0, sizeof(key));
     g_quietSince = ms();
 
     xTaskCreatePinnedToCore(camTask, "camera", 8192, nullptr, 2, &g_camTask, 0);

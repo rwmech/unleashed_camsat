@@ -76,6 +76,7 @@
 #include "core/linkfam.h"
 #include "core/photos.h"
 #include "core/plugin.h"
+#include "core/runner.h"
 #include "core/sysconfig.h"
 #include "platform/platform.h"
 #include "plugins/camera_rules.h"
@@ -209,6 +210,15 @@ struct Sat {
     uint32_t pictures = 0;
     uint32_t lastAt = 0;                     // epoch of its last picture
     uint32_t eventAt = 0;                    // millis of its last EVENT answered
+    // From its SETTINGS_OK (1.2.0, one satellite and several boards):
+    bool     owned = true;                   // this board owns it: its settings are used
+    bool     events = false;                 // it runs its own timelapse clock (EVENT)
+    // What it runs, from its SETTINGS_OK, for SATS.
+    bool     sleeps = false;
+    uint16_t tlMin = 0;
+    uint8_t  tlSec = 0;
+    bool     motion = false;
+    uint16_t hold = 0;
 };
 // On the heap from the first start, like the limits: a plugin that is off
 // costs the board no static RAM (every official image carries this one).
@@ -221,11 +231,13 @@ bool peerUp(int peer) {
     return e && peer >= 0 && e->peerUp(static_cast<uint8_t>(peer));
 }
 
-// firstUp: the first satellite whose link is up, or -1.
-int firstUp() {
+// firstUp: the first satellite whose link is up, or -1. clocked: only one
+// that leaves its timelapse to this board's clock (before 1.2.0).
+int firstUp(bool clocked = false) {
     for (uint8_t i = 0; i < ulink::Engine::kPeers; ++i) {
         const int p = satPeer(i);
         if (p < 0) break;
+        if (clocked && g_sat && g_sat[p].events) continue;
         if (peerUp(p)) return p;
     }
     return -1;
@@ -264,6 +276,7 @@ struct Job {
     uint16_t pw = 0, ph2 = 0;
     std::atomic<bool> filed{ false };
     char     err[72] = {};                   // the loop's reason
+    uint8_t  busyAt = 0;                     // SNAP_FAIL busy: 0 none, 1 + the requests ahead, 0xFF full
     char     rerr[72] = {};                  // the runner's (bulkData, bulkFinish)
     // The part-file is the runner's while it is inside bulkData or
     // bulkFinish, and the loop's otherwise: wbusy is who holds it now. dead
@@ -274,6 +287,12 @@ struct Job {
     std::atomic<bool> dead{ false };
     bool     dying = false;
     bool     dyingOk = false;
+    // The part-file of a picture given up on the loop (finish, a CONFIG save
+    // mid-picture), closed and removed on the runner: on the loop that was a
+    // 51-87 ms slow pass on the card (camsat bench, 2026-09-27). Until it is
+    // gone no new picture starts, since the next would open the same name.
+    struct Closer : runner::Job { photos::Writer w; };
+    Closer   closer;
 };
 Job* g_jobp = nullptr;                     // the heap, from the first start
 inline Job& job() { return *g_jobp; }
@@ -289,7 +308,25 @@ Closing  g_closing;
 char     g_last[112] = {};
 char     g_lastBy[BBS_USER_MAX + 8] = {};
 
-bool busy() { return g_jobp && g_jobp->ph.load() != J_IDLE; }
+bool busy() { return g_jobp && (g_jobp->ph.load() != J_IDLE || !runner::idle(g_jobp->closer)); }
+
+void closeWork(runner::Job& self) { photos::abandon(static_cast<Job::Closer&>(self).w); }
+
+// abandonLater (loop): the part-file to the runner to close and remove. On
+// the loop only if the runner will not take it (its queue is full).
+void abandonLater(Job& j) {
+    if (runner::done(j.closer)) runner::collect(j.closer);
+    if (runner::idle(j.closer)) {
+        j.closer.w = j.w;
+        j.w = photos::Writer();
+        j.closer.work = closeWork;
+        j.closer.name = "camsat close";
+        if (runner::post(j.closer)) return;
+        j.w = j.closer.w;                       // not taken: back, and done here
+        j.closer.w = photos::Writer();
+    }
+    photos::abandon(j.w);
+}
 
 bool takeWriter() { bool e = false; return job().wbusy.compare_exchange_strong(e, true); }
 void giveWriter() { job().wbusy.store(false); }
@@ -303,7 +340,7 @@ bool dropWriter() {
     Job& j = job();
     j.dead.store(true);
     if (!takeWriter()) return false;
-    if (j.writerOpen) { photos::abandon(j.w); j.writerOpen = false; }
+    if (j.writerOpen) { abandonLater(j); j.writerOpen = false; }
     giveWriter();
     return true;
 }
@@ -361,6 +398,9 @@ void sendSettings(uint8_t peer) {
     b[18] = g_set.levels;
     b[19] = g_set.gamma;
     b[20] = g_set.pin;
+    // What this board takes (1.2.0): its own choice, whoever owns the
+    // satellite. Bytes 0 to 20 count only from the owner.
+    b[kSetRecv] = static_cast<uint8_t>(linkp::peerRecv(peer) | RECV_SAID);
     e->send(peer, sess, ulink::FAM_CAMERA, CAM_SETTINGS, b, sizeof(b));
     e->closeAfter(peer, sess);
 }
@@ -507,6 +547,32 @@ void finish(bool ok) {
     s->term.cursor(s->tl, true);
     s->term.nl(s->tl);
     char buf[160];
+    const uint8_t busyAt = j.busyAt;
+    j.busyAt = 0;
+    if (!ok && busyAt) {
+        const char* nm = j.peer < ulink::Engine::kPeers ? g_sat[j.peer].name : "satellite";
+        const bool wide = b.rowWidth(*s) >= 60;
+        if (busyAt == 0xFF)
+            snprintf(buf, sizeof(buf), wide ? "The %s camera is busy and its queue is full. Try again in a moment."
+                                            : "The %s camera's queue is full.\n    Try again in a moment.", nm);
+        else if (busyAt == 1)
+            snprintf(buf, sizeof(buf), wide ? "The %s camera is busy. Try again in a moment."
+                                            : "The %s camera is busy.\n    Try again in a moment.", nm);
+        else
+            snprintf(buf, sizeof(buf), wide ? "The %s camera is busy, %u ahead of you. Try again in a moment."
+                                            : "The %s camera is busy,\n    %u ahead of you: try in a moment.",
+                     nm, static_cast<unsigned>(busyAt - 1));
+        // Two lines at 40, each whole (a wrap would break "2 ahead / of you").
+        char* nl = strchr(buf, '\n');
+        if (nl) *nl = '\0';
+        // The board's voice, "--> ", as the built-in camera's "in use" line.
+        s->term.color(s->tl, Color::Cyan);
+        s->term.text(s->tl, "--> ");
+        say(*s, Color::Yellow, buf);
+        if (nl) { s->term.nl(s->tl); say(*s, Color::Yellow, nl + 1); }
+        b.release(*s);
+        return;
+    }
     if (!ok) {
         snprintf(buf, sizeof(buf), "No photo: %.71s.", why[0] ? why : "the satellite gave none");
         say(*s, Color::LightRed, buf);
@@ -602,6 +668,8 @@ bool message(uint8_t peer, uint16_t sess, uint8_t type, const uint8_t* p, size_t
                 static const char* const kWhy[] = { "the satellite failed", "the satellite has no camera",
                                                     "the satellite is out of memory", "the satellite is busy",
                                                     "the satellite's flash failed", "the satellite's camera gave no picture" };
+                // Busy (1.2.0): the requests ahead in its queue, or full.
+                if (p[2] == CE_BUSY) job().busyAt = n >= 4 ? (p[3] == kQueueFull ? 0xFF : static_cast<uint8_t>(p[3] + 1)) : 1;
                 failWith(kWhy[p[2] < 6 ? p[2] : 0]);
             }
             return true;
@@ -615,6 +683,22 @@ bool message(uint8_t peer, uint16_t sess, uint8_t type, const uint8_t* p, size_t
             return true;
         }
         case CAM_SETTINGS_OK:
+            // A satellite from 1.2.0 says whether this board owns it and that
+            // it keeps its own timelapse clock; one before says neither, and
+            // is this board's alone, on this board's clock.
+            if (n >= 23) {
+                s.owned = (p[kSetOwner] & SO_OWNER) || !(p[kSetOwner] & SO_EVENTS);
+                s.events = (p[kSetOwner] & SO_EVENTS) != 0;
+            }
+            if (n >= 21) {
+                s.tlMin = get16(p + kSetTimelapseMin);
+                s.tlSec = p[kSetTimelapseSec];
+                s.motion = p[kSetMotion] != 0;
+                s.hold = get16(p + kSetHoldoff);
+                s.sleeps = p[kSetSleep] != 0;
+            }
+            e->closeAfter(peer, sess);
+            return true;
         default:
             return true;
     }
@@ -645,6 +729,13 @@ const linkp::Family kFamily = [] {
     f.reset = reset;
     f.peerState = peerState;
     f.bulkFinish = bulkFinish;
+    // CONFIG sats changed what this board takes, or a satellite's number:
+    // the satellite is told now, and the camera list follows (1.2.0).
+    f.settingsChanged = [](uint8_t peer) {
+        ulink::Engine* e = linkp::engine();
+        if (g_running && e && e->peerUp(peer) && e->peerKind(peer) == ulink::KIND_CAMSAT) sendSettings(peer);
+        reconcile();
+    };
     return f;
 }();
 
@@ -655,6 +746,7 @@ void tick(uint32_t now) {
     static uint32_t listedAt = 0;
     if (static_cast<int32_t>(now - listedAt) >= 1000) { listedAt = now; reconcile(); }
     Job& j = job();
+    if (runner::done(j.closer)) runner::collect(j.closer);   // a given-up part-file is gone
     if (g_closing.on && static_cast<int32_t>(now - g_closing.at) >= 0) {
         if (ulink::Engine* e = linkp::engine()) e->closeAfter(g_closing.peer, g_closing.sess);
         g_closing.on = false;
@@ -668,7 +760,10 @@ void tick(uint32_t now) {
         if (every && !g_set.sleep && localNow(t)) {
             const uint32_t local = static_cast<uint32_t>(t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec) +
                                    static_cast<uint32_t>(t.tm_yday) * camrules::kDay;
-            if (camrules::tlDue(local, every, g_tlSlot, g_tlPrimed)) startSystem(firstUp(), 0, CR_TIMELAPSE);
+            if (camrules::tlDue(local, every, g_tlSlot, g_tlPrimed)) {
+                const int p = firstUp(true);
+                if (p >= 0) startSystem(p, 0, CR_TIMELAPSE);
+            }
         }
         return;
     }
@@ -676,7 +771,9 @@ void tick(uint32_t now) {
     // started from the link's message in this same pass has a start later
     // than this tick's now (the bench: every EVENT failed at once).
     const int32_t age = static_cast<int32_t>(now - j.startedAt);
-    if (ph == J_ASKED && age > 30000) { failWith("the satellite did not answer"); return; }
+    // 60 s: a satellite shared by several boards (1.2.0) queues a SNAP
+    // behind the other boards' pictures, a few seconds each.
+    if (ph == J_ASKED && age > 60000) { failWith("the satellite did not answer"); return; }
     if (ph == J_COMING && age > 120000) {
         const uint8_t peer = j.peer;
         const uint16_t sess = j.sess;
@@ -751,6 +848,7 @@ void snapFrom(Bbs& b, Session& s, int peer, uint32_t now) {
     j.peer = static_cast<uint8_t>(peer);
     j.sess = sess;
     j.ours = true;
+    j.busyAt = 0;
     j.node = s.id;
     j.waiting = true;
     j.err[0] = '\0';
@@ -806,6 +904,40 @@ bool satBusy(void* ctx) {
 
 void satSnap(void* ctx, Bbs& b, Session& s, uint32_t now) {
     snapFrom(b, s, static_cast<Sat*>(ctx)->peer, now);
+}
+
+// For SATS (1.2.0): who may see it, and what it says of itself.
+void satLevels(void*, PlugLevel& see, PlugLevel& snap) {
+    see = g_set.photos;
+    snap = g_set.snap;
+}
+
+bool satFacts(void* ctx, photos::CamFacts& f) {
+    const Sat& x = *static_cast<Sat*>(ctx);
+    const bool up = peerUp(x.peer);
+    // Asleep only while it has been heard within twice its timelapse and 5
+    // minutes (a day for one that only wakes on motion): a sleeper whose
+    // battery died is not answering, not asleep for ever (code review).
+    bool dozing = false;
+    if (!up && x.sleeps) {
+        ulink::Engine* e = linkp::engine();
+        const uint32_t heard = e ? e->peerStats(x.peer).lastHeard : 0;
+        const uint32_t tl = (static_cast<uint32_t>(x.tlMin) * 60u + x.tlSec) * 1000u;
+        const uint32_t grace = tl ? 2u * tl + 300000u : 86400000u;
+        dozing = heard && plat::millis() - heard < grace;
+    }
+    f.state = busy() && job().peer == x.peer ? photos::CST_BUSY
+            : up ? photos::CST_AWAKE : dozing ? photos::CST_ASLEEP : photos::CST_NOANSWER;
+    f.lastAt = x.lastAt;
+    f.pictures = x.pictures;
+    f.uptime = up ? x.uptime : 0;
+    snprintf(f.sensor, sizeof(f.sensor), "%s", x.sensor);
+    f.sleeps = x.sleeps;
+    f.tlMin = x.tlMin;
+    f.tlSec = x.tlSec;
+    f.motion = x.motion;
+    f.hold = x.hold;
+    return true;
 }
 
 // satLine: CAMERA's list line: the sensor, the signal, the pictures taken.
@@ -873,11 +1005,20 @@ void reconcile() {
             photos::removeCamera(x.cam);
             x.listed = false;
         }
+        // Its camera number (CONFIG sats, 1.2.0) followed without re-listing.
+        if (x.listed && x.cam.number != linkp::peerCamNo(p)) {
+            x.cam.number = linkp::peerCamNo(p);
+            photos::renumber();
+        }
         if (want && !x.listed) {
             x.peer = p;
             snprintf(x.name, sizeof(x.name), "%s", name && *name ? name : "satellite");
             x.cam = photos::Camera{ x.name, static_cast<uint8_t>(1 + p), &x, satUp, satBusy, satSnap, satLine,
                                     satCommand };
+            x.cam.number = linkp::peerCamNo(p);
+            x.cam.pairing = static_cast<int8_t>(p);
+            x.cam.levels = satLevels;
+            x.cam.facts = satFacts;
             x.listed = photos::addCamera(x.cam);
             if (!x.listed) plat::log("camsat: the board's camera list is full; \"%s\" is not in it", x.name);
         }

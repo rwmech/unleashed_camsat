@@ -181,8 +181,9 @@ void close() {
 // unstick: the sensor stopped answering on its SCCB bus (seen on the bench,
 // now and then, after a picture that went fine: every later bring-up then
 // finds nothing until the satellite restarts). Clock SDA free if the sensor
-// is holding it, and power the sensor down and up again through PWDN.
-void unstick() {
+// is holding it, and power the sensor down and up again through PWDN, for
+// downMs, then give it upMs to wake.
+void unstick(uint32_t downMs = 200, uint32_t upMs = 50) {
     const gpio_num_t sda = static_cast<gpio_num_t>(CAM_SIOD), scl = static_cast<gpio_num_t>(CAM_SIOC);
     gpio_reset_pin(sda);
     gpio_reset_pin(scl);
@@ -202,9 +203,9 @@ void unstick() {
     gpio_reset_pin(pwdn);
     gpio_set_direction(pwdn, GPIO_MODE_OUTPUT);
     gpio_set_level(pwdn, 1);
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(downMs));
     gpio_set_level(pwdn, 0);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(upMs));
 }
 
 // meter: the OV2640's exposure and gain, or the GC0308's average and
@@ -466,10 +467,20 @@ bool snap(const SnapReq& r, const PicSettings& s, Pic& pic) {
         ESP_LOGW(TAG, "the sensor did not answer: freeing its bus and trying again");
         unstick();
         if (!open(frameOf(size), q, s, why, sizeof(why))) {
-            pic.stuck = g_sensor[0] != '\0';
-            return fail(linkfam::CE_NOSENSOR, why);
+            // A third time, powered down longer and given longer to wake:
+            // after an EN reset the bench saw the sensor read PID 0xFF twice
+            // in a row, and a caller told "no camera found" (camsat bench,
+            // 2026-09-27; never after deep sleep).
+            ESP_LOGW(TAG, "the sensor did not answer again: a longer power-down and a third try");
+            unstick(500, 300);
+            if (!open(frameOf(size), q, s, why, sizeof(why))) {
+                pic.stuck = g_sensor[0] != '\0';
+                return fail(linkfam::CE_NOSENSOR, why);
+            }
+            ESP_LOGW(TAG, "the sensor answered the third time");
+        } else {
+            ESP_LOGW(TAG, "the sensor answered the second time");
         }
-        ESP_LOGW(TAG, "the sensor answered the second time");
     }
     if (fl == linkfam::CF_ON) { flash(true); pic.flashed = true; }
     pic.settleFrames = settle();

@@ -5,9 +5,10 @@
 // File:         firmware/src/store.h
 // Module:       What the satellite keeps across a power cut
 //
-// Purpose:      In NVS: the pairing (the board's MAC and the link key,
-//               never printed), the settings the board last sent, and the
-//               satellite's own name. In RTC memory, across deep sleep only:
+// Purpose:      In NVS: the pairings, up to five boards (1.2.0: each
+//               board's MAC, its link key, never printed, its place in the
+//               order, its name and what it wants delivered), the settings
+//               the owner last sent, and the satellite's own name. In RTC memory, across deep sleep only:
 //               the channel the board was last found on, so a satellite
 //               that wakes to take a picture does not scan for it.
 //
@@ -48,10 +49,22 @@ struct SatSettings {
 
 namespace store {
 
+// One board this satellite is paired with (1.2.0).
+constexpr uint8_t kBoards = 5;
+struct BoardRec {
+    uint8_t mac[6];
+    uint8_t key[16];
+    uint8_t ord;               // the lowest is the owner
+    uint8_t recv;              // RECV_* (linkfam), what it wants delivered
+    char    name[17];
+};
+
 bool begin();
-// The pairing. load: false when there is none.
-bool loadPairing(uint8_t mac[6], uint8_t key[16]);
-bool savePairing(const uint8_t mac[6], const uint8_t key[16]);
+// loadBoards: the boards, their count. A satellite paired before 1.2.0 has
+// one pairing under the old keys: it is read as the owner, wanting every
+// picture, and written in the new form at the next save.
+uint8_t loadBoards(BoardRec out[kBoards]);
+bool saveBoards(const BoardRec* b, uint8_t n);
 void forget();
 // The settings the board last sent (defaults when it never has).
 void loadSettings(SatSettings& s);

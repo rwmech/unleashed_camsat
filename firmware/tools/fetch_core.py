@@ -51,6 +51,7 @@ FILES = [
     "src/core/linkcrypto.h",
     "src/core/linkcrypto.cpp",
     "src/core/linkfam.h",
+    "src/core/satwords.h",
     "src/core/crc32.h",
     "src/plugins/camera_pic.h",
     "src/plugins/camera_mark.h",
@@ -89,7 +90,9 @@ def fetch(root, fw):
     src, commit = lock["source"], lock["commit"]
     out = os.path.join(fw, "core")
     stamp = os.path.join(out, ".commit")
-    want = src + " " + commit
+    # The file list is part of what was fetched: a file added to FILES
+    # (satwords.h, 1.2.0) must bring a fresh copy, not "already there".
+    want = src + " " + commit + " " + str(len(FILES)) + ":" + FILES[-1]
     if commit != "-" and os.path.exists(stamp) and open(stamp).read().strip() == want:
         return                                           # already there
     if commit != "-" and not re.fullmatch(r"[0-9a-f]{40}", commit):

@@ -10,4 +10,4 @@
 ; Copyright 2026 - Robert Mech
 ; SPDX-License-Identifier: GPL-3.0-or-later
 source = ../esp32-bbs-c1/esp32-bbs
-commit = 4df93cfe678b1c2e57f5528e37a9bf66717650fd
+commit = 5bb082a2625ee1cb31bd2b846475146b1635cad9
