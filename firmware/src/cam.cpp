@@ -41,6 +41,7 @@
 #include <new>
 
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -70,6 +71,12 @@ uint8_t* g_out = nullptr;
 char     g_sensor[12] = "";
 uint8_t  g_maxSize = 0;
 uint16_t g_pid = 0;
+// The same two, kept through deep sleep for the status a wake sends before
+// its camera comes up (the board's CAMERA said "Sensor not said yet" for a
+// sleeping satellite for ever). g_sensor alone still means "answered this
+// boot", which is what a stuck sensor's restart is decided on.
+RTC_DATA_ATTR char    r_sensor[12] = "";
+RTC_DATA_ATTR uint8_t r_maxSize = 0;
 
 uint32_t ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
@@ -136,6 +143,8 @@ bool open(framesize_t fs, uint8_t quality, const PicSettings& s, char* err, size
         snprintf(g_sensor, sizeof(g_sensor), "%s", info ? info->name : "unknown");
         g_pid = x->id.PID;
         if (info) g_maxSize = csOf(info->max_size);
+        memcpy(r_sensor, g_sensor, sizeof(r_sensor));
+        r_maxSize = g_maxSize;
         if (x->set_vflip)          x->set_vflip(x, s.flip ? 1 : 0);
         if (x->set_hmirror)        x->set_hmirror(x, s.mirror ? 1 : 0);
         if (x->set_brightness)     x->set_brightness(x, s.bright);
@@ -427,8 +436,8 @@ bool begin() {
     return g_out != nullptr;
 }
 
-const char* sensor() { return g_sensor; }
-uint8_t maxSize() { return g_maxSize; }
+const char* sensor() { return g_sensor[0] ? g_sensor : r_sensor; }
+uint8_t maxSize() { return g_sensor[0] ? g_maxSize : r_maxSize; }
 
 bool snap(const SnapReq& r, const PicSettings& s, Pic& pic) {
     pic = Pic();

@@ -263,7 +263,8 @@ struct Job {
     uint32_t bytes = 0;
     uint16_t pw = 0, ph2 = 0;
     std::atomic<bool> filed{ false };
-    char     err[72] = {};
+    char     err[72] = {};                   // the loop's reason
+    char     rerr[72] = {};                  // the runner's (bulkData, bulkFinish)
     // The part-file is the runner's while it is inside bulkData or
     // bulkFinish, and the loop's otherwise: wbusy is who holds it now. dead
     // tells the runner the loop has given the picture up, so it closes the
@@ -400,19 +401,22 @@ bool bulkBegin(uint8_t peer, uint16_t sess, uint8_t type, uint32_t total) {
     j.bytes = 0;
     j.writerOpen = false;
     j.filed.store(false);
+    j.rerr[0] = '\0';
     j.dead.store(false);
-    j.ph.store(J_COMING);
-    return true;
+    // Only from ASKED: the loop may have ended the job since the check above
+    // (a CONFIG save, the 30 s timeout), and a plain store would bring it back.
+    uint8_t asked = J_ASKED;
+    return j.ph.compare_exchange_strong(asked, J_COMING);
 }
 
 bool bulkWrite(Job& j, const uint8_t* p, size_t n) {
     while (n && j.headGot < kPictureHeader) { j.head[j.headGot++] = *p++; --n; }
     if (!n) return true;
     if (!j.writerOpen) {
-        if (!photos::open(j.w, ".sat0.tmp")) { snprintf(j.err, sizeof(j.err), "the card would not take the photo"); return false; }
+        if (!photos::open(j.w, ".sat0.tmp")) { snprintf(j.rerr, sizeof(j.rerr), "the card would not take the photo"); return false; }
         j.writerOpen = true;
     }
-    if (!photos::write(j.w, p, n)) { snprintf(j.err, sizeof(j.err), "the card would not take the photo"); return false; }
+    if (!photos::write(j.w, p, n)) { snprintf(j.rerr, sizeof(j.rerr), "the card would not take the photo"); return false; }
     j.bytes += static_cast<uint32_t>(n);
     return true;
 }
@@ -426,6 +430,7 @@ bool bulkData(uint8_t, uint16_t sess, const uint8_t* p, size_t n) {
         if (j.writerOpen) { photos::abandon(j.w); j.writerOpen = false; }
     } else {
         ok = bulkWrite(j, p, n);
+        if (j.dead.load() && j.writerOpen) { photos::abandon(j.w); j.writerOpen = false; ok = false; }
     }
     giveWriter();
     return ok;
@@ -438,12 +443,12 @@ void bulkFinish(uint8_t, uint16_t sess, bool ok) {
         j.writerOpen = false;
         if (!ok || j.dead.load()) {
             photos::abandon(j.w);
-            if (!ok) snprintf(j.err, sizeof(j.err), "the picture came damaged");
+            if (!ok) snprintf(j.rerr, sizeof(j.rerr), "the picture came damaged");
         } else {
             j.pw = get16(j.head + 4);
             j.ph2 = get16(j.head + 6);
             if (photos::file(j.w, j.rel, j.kind == K_CALLER ? j.desc : nullptr)) j.filed.store(true);
-            else snprintf(j.err, sizeof(j.err), "a photo with that name is already there, or the card refused it");
+            else snprintf(j.rerr, sizeof(j.rerr), "a photo with that name is already there, or the card refused it");
         }
     }
     giveWriter();
@@ -468,6 +473,11 @@ void finish(bool ok) {
     Job& j = job();
     if (!dropWriter()) { j.dying = true; j.dyingOk = ok; return; }   // the runner's: next tick
     j.dying = false;
+    // The runner may have filed it before the loop failed the job (a reset
+    // or a CONFIG save in the pass between bulkFinish and bulkEnd): it is in
+    // Photos and counted, so say so.
+    ok = ok || j.filed.load();
+    const char* why = j.err[0] ? j.err : j.rerr;
     ulink::Engine* e = linkp::engine();
     if (e) {                                   // ours or the satellite's (an EVENT): let it go
         if (g_closing.on) e->closeAfter(g_closing.peer, g_closing.sess);   // the one before, now
@@ -481,7 +491,7 @@ void finish(bool ok) {
                   static_cast<unsigned>(j.ph2), static_cast<unsigned>(j.bytes), linkp::peerName(j.peer),
                   static_cast<unsigned>(plat::millis() - j.startedAt));
     } else {
-        plat::log("camsat: %s failed: %s", j.rel[0] ? j.rel : "a picture", j.err[0] ? j.err : "no reason given");
+        plat::log("camsat: %s failed: %s", j.rel[0] ? j.rel : "a picture", why[0] ? why : "no reason given");
     }
     Session* s = waiter();
     const uint8_t kind = j.kind, node = j.node;
@@ -498,7 +508,7 @@ void finish(bool ok) {
     s->term.nl(s->tl);
     char buf[160];
     if (!ok) {
-        snprintf(buf, sizeof(buf), "No photo: %.71s.", j.err[0] ? j.err : "the satellite gave none");
+        snprintf(buf, sizeof(buf), "No photo: %.71s.", why[0] ? why : "the satellite gave none");
         say(*s, Color::LightRed, buf);
         b.release(*s);
         return;
@@ -522,9 +532,9 @@ void finish(bool ok) {
     b.release(*s);
 }
 
-void bulkEnd(uint8_t, uint16_t sess, bool) {
+void bulkEnd(uint8_t peer, uint16_t sess, bool) {
     Job& j = job();
-    if (sess != j.sess || j.ph.load() != J_COMING) return;
+    if (peer != j.peer || sess != j.sess || j.ph.load() != J_COMING) return;
     // bulkFinish has run on the runner by now: it filed the picture or said why not.
     finish(j.filed.load());
 }
@@ -563,6 +573,8 @@ bool startSystem(int peer, uint16_t sess, uint8_t reason) {
     j.node = 0xFF;
     j.waiting = false;
     j.err[0] = '\0';
+    j.rerr[0] = '\0';
+    j.filed.store(false);
     snprintf(j.handle, sizeof(j.handle), "%s", folder);
     j.startedAt = plat::millis();
     j.ph.store(J_ASKED);
@@ -586,7 +598,7 @@ bool message(uint8_t peer, uint16_t sess, uint8_t type, const uint8_t* p, size_t
             e->closeAfter(peer, sess);                 // one message a session: the table holds 16
             return true;
         case CAM_SNAP_FAIL:
-            if (n >= 3 && sess == job().sess && job().ph.load() == J_ASKED) {
+            if (n >= 3 && peer == job().peer && sess == job().sess && job().ph.load() == J_ASKED) {
                 static const char* const kWhy[] = { "the satellite failed", "the satellite has no camera",
                                                     "the satellite is out of memory", "the satellite is busy",
                                                     "the satellite's flash failed", "the satellite's camera gave no picture" };
@@ -608,8 +620,8 @@ bool message(uint8_t peer, uint16_t sess, uint8_t type, const uint8_t* p, size_t
     }
 }
 
-void reset(uint8_t, uint16_t sess, uint8_t reason) {
-    if (sess != job().sess || !busy() || job().dying) return;
+void reset(uint8_t peer, uint16_t sess, uint8_t reason) {
+    if (peer != job().peer || sess != job().sess || !busy() || job().dying) return;
     char why[48];
     snprintf(why, sizeof(why), "the link to the satellite dropped (%u)", static_cast<unsigned>(reason));
     failWith(why);
@@ -647,9 +659,8 @@ void tick(uint32_t now) {
         if (ulink::Engine* e = linkp::engine()) e->closeAfter(g_closing.peer, g_closing.sess);
         g_closing.on = false;
     }
-    // A finish the runner held off: again, and a picture bulkFinish filed
-    // meanwhile is said as filed, not as the failure that asked.
-    if (j.dying) { finish(j.dyingOk || j.filed.load()); return; }
+    // A finish the runner held off: again.
+    if (j.dying) { finish(j.dyingOk); return; }
     const uint8_t ph = j.ph.load();
     if (ph == J_IDLE) {
         const uint32_t every = tlEvery();
@@ -743,6 +754,8 @@ void snapFrom(Bbs& b, Session& s, int peer, uint32_t now) {
     j.node = s.id;
     j.waiting = true;
     j.err[0] = '\0';
+    j.rerr[0] = '\0';
+    j.filed.store(false);
     j.startedAt = now;
     j.spinAt = now;
     j.ph.store(J_ASKED);

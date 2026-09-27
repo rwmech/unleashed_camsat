@@ -93,9 +93,10 @@ bool begin();
 // snap: one picture into pic (pic.buf is the buffer begin made). False with
 // pic.err and pic.failCode set.
 bool snap(const SnapReq& r, const PicSettings& s, Pic& pic);
-// sensor: the model the last bring-up found, "" before one.
+// sensor: the model the last bring-up found, kept through deep sleep; ""
+// before the first since any reset other than a deep-sleep wake.
 const char* sensor();
-// maxSize: the largest CS_* the sensor gives, 0 before a bring-up.
+// maxSize: the largest CS_* the sensor gives, kept the same way; 0 before one.
 uint8_t maxSize();
 
 }  // namespace cam
