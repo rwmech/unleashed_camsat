@@ -83,7 +83,7 @@
 #include "plugins/files.h"
 #include "plugins/link.h"
 
-UNLEASHED_PLUGIN_API(1, 0);
+UNLEASHED_PLUGIN_API(1, 1);
 
 using namespace linkfam;
 
@@ -262,7 +262,7 @@ struct Job {
     bool     ours = false;                   // this board opened the session
     uint8_t  node = 0xFF;                    // the caller waiting
     bool     waiting = false;
-    char     rel[112] = {};                  // under Photos
+    char     rel[112] = {};                  // under Photos; the runner moves it a second on if taken
     char     desc[48] = {};                  // FILES.BBS, a caller's only
     char     handle[BBS_USER_MAX + 2] = {};
     uint32_t startedAt = 0, spinAt = 0;
@@ -487,7 +487,11 @@ void bulkFinish(uint8_t, uint16_t sess, bool ok) {
         } else {
             j.pw = get16(j.head + 4);
             j.ph2 = get16(j.head + 6);
-            if (photos::file(j.w, j.rel, j.kind == K_CALLER ? j.desc : nullptr)) j.filed.store(true);
+            // Under the next second's name, up to five on, when another camera
+            // filed one in the same second (the built-in camera, another
+            // satellite's motion picture): 1.2.0's fileAs, which also puts the
+            // name it used in j.rel for the offer and the log.
+            if (photos::fileAs(j.w, j.rel, sizeof(j.rel), j.kind == K_CALLER ? j.desc : nullptr)) j.filed.store(true);
             else snprintf(j.rerr, sizeof(j.rerr), "a photo with that name is already there, or the card refused it");
         }
     }

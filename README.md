@@ -99,8 +99,8 @@ Each paired satellite is a camera in the board's own camera list, under the name
 | `SATS [n]` | callers (as the sysop sets) | the satellites: the number `SNAPSHOT` takes, name, awake or asleep, last picture. Staff also see the radio, and `SATS n` one in full |
 | `LINK` | staff | every paired device on the link, and the boards sharing each |
 | `CONFIG sats` | sysop | each satellite: its name, its camera number, and what it sends to this board |
-| `CONFIG cameras` | sysop | which camera `SNAPSHOT` uses when none is named |
-| `CONFIG camsat` | sysop | size, quality, names, watermark, flash, timelapse, motion, picture settings, deep sleep |
+| `CONFIG photos` | sysop | which camera `SNAPSHOT` uses when none is named (`CONFIG cameras` before 1.2.0's naming, still accepted) |
+| `CONFIG sat <name>` | sysop | one satellite: its name, camera number, what it sends to this board, and **Camera settings**: size, quality, names, watermark, flash, timelapse, motion, picture settings, deep sleep (`CONFIG camsat` still opens those) |
 
 With one camera on the board, `SNAPSHOT` is simply that camera and `CAMERA` shows it directly.
 
