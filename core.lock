@@ -9,5 +9,5 @@
 ;
 ; Copyright 2026 - Robert Mech
 ; SPDX-License-Identifier: GPL-3.0-or-later
-source = ../esp32-bbs-c1/esp32-bbs
-commit = 5bb082a2625ee1cb31bd2b846475146b1635cad9
+source = https://github.com/rwmech/unleashed_BBS
+commit = 471e3274b54e6d6aaea19061eb4d2b967ca84de1

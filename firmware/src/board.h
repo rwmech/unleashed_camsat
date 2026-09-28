@@ -34,7 +34,7 @@
 // ===========================================================================
 #pragma once
 
-#define CAMSAT_VERSION   "1.0.0"
+#define CAMSAT_VERSION   "1.1.0"
 #define CAMSAT_NAME      "camsat"
 
 // The red LED on the back, 3V3 through the LED to the pin: lit when low.

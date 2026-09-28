@@ -1174,7 +1174,7 @@ const char* status() {
 }  // namespace
 
 extern const Plugin kCamsatPlugin = {
-    { kName, "Camera satellite", "1.0.0", 4096, 0, PF_SD | PF_FAST,
+    { kName, "Camera satellite", "1.1.0", 4096, 0, PF_SD | PF_FAST,
       PlugLevel::All, PlugLevel::Staff, PlugLevel::Sysop },
     start,
     stop,
