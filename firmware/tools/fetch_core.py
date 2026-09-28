@@ -82,7 +82,15 @@ def read_lock(root):
 
 
 def git(*args, cwd=None):
-    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True).stdout
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True)
+    if r.returncode:
+        sys.exit("fetch_core: git %s failed: %s" % (" ".join(args), r.stderr.decode(errors="replace").strip()))
+    return r.stdout
+
+
+def has_commit(repo, commit):
+    return subprocess.run(["git", "cat-file", "-e", commit + "^{commit}"], cwd=repo,
+                          capture_output=True).returncode == 0
 
 
 def fetch(root, fw):
@@ -105,7 +113,13 @@ def fetch(root, fw):
         if not os.path.isdir(os.path.join(repo, ".git")):
             git("clone", "--no-checkout", src, repo)
         else:
-            git("fetch", "origin", cwd=repo)
+            # The cache follows core.lock's source (a fork, a mirror), and is
+            # fetched only when it lacks the commit, so a rebuild offline works.
+            if git("remote", "get-url", "origin", cwd=repo).decode().strip() != src:
+                git("remote", "set-url", "origin", src, cwd=repo)
+                git("fetch", "origin", cwd=repo)
+            elif commit == "-" or not has_commit(repo, commit):
+                git("fetch", "origin", cwd=repo)
     if os.path.isdir(out):
         shutil.rmtree(out)
     os.makedirs(out)
