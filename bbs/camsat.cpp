@@ -819,7 +819,7 @@ void snapFrom(Bbs& b, Session& s, int peer, uint32_t now) {
             char at[8], buf[96];
             clk::fmtEpoch(at, sizeof(at), "%H:%M", v.nextAt);
             snprintf(buf, sizeof(buf), "That is %u %s; the next one is allowed at %s.",
-                     static_cast<unsigned>(v.byDay ? camrules::kPerDay : camrules::kPerHour),
+                     static_cast<unsigned>(v.byDay ? v.perDay : v.perHour),
                      v.byDay ? "today" : "this hour", at);
             refuse(b, s, buf);
             return;
@@ -865,8 +865,8 @@ void snapFrom(Bbs& b, Session& s, int peer, uint32_t now) {
         photos::spend(s, epoch);
         char buf[80];
         snprintf(buf, sizeof(buf), "Snapshot %u of %u this hour, %u of %u today.",
-                 static_cast<unsigned>(v.hour + 1), static_cast<unsigned>(camrules::kPerHour),
-                 static_cast<unsigned>(v.day + 1), static_cast<unsigned>(camrules::kPerDay));
+                 static_cast<unsigned>(v.hour + 1), static_cast<unsigned>(v.perHour),
+                 static_cast<unsigned>(v.day + 1), static_cast<unsigned>(v.perDay));
         say(s, Color::Grey, buf);
         s.term.nl(s.tl);
     }
