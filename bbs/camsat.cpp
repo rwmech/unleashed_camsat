@@ -83,7 +83,7 @@
 #include "plugins/files.h"
 #include "plugins/link.h"
 
-UNLEASHED_PLUGIN_API(1, 1);
+UNLEASHED_PLUGIN_API(1, 2);
 
 using namespace linkfam;
 
@@ -623,6 +623,9 @@ bool startSystem(int peer, uint16_t sess, uint8_t reason) {
     ulink::Engine* e = linkp::engine();
     struct tm t;
     if (!e || busy() || peer < 0 || !plat::sdBase()[0] || !localNow(t)) return false;
+    // Under the card's floor the board's own pictures are skipped, as the
+    // built-in camera's are (photos::tally, API 1.2).
+    if (photos::tally().known && !photos::tally().floorMet) return false;
     Job& j = job();
     const char* folder = reason == CR_MOTION ? camrules::kMotionFolder : camrules::kTlFolder;
     const char* prefix = reason == CR_MOTION ? "MO" : camrules::kTlPrefix;
@@ -824,6 +827,13 @@ void snapFrom(Bbs& b, Session& s, int peer, uint32_t now) {
             refuse(b, s, buf);
             return;
         }
+    }
+    // The card's floor, as the built-in camera has it: the photo system's
+    // prune could not make the room (photos::tally, API 1.2).
+    if (photos::tally().known && !photos::tally().floorMet) {
+        photos::pruneSoon();                           // count again: space may have been freed
+        refuse(b, s, "The card is too full for another photo.");
+        return;
     }
     if (busy()) { refuse(b, s, "The camera is busy. Try again in a moment."); return; }
     struct tm t;

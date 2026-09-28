@@ -106,7 +106,9 @@ With one camera on the board, `SNAPSHOT` is simply that camera and `CAMERA` show
 
 Photos land in the Photos area (FILES), named like a built-in camera's: `SNAP-20260926-114523.JPG` for a caller's, `timelapse/TL-...` and `motion/MO-...` for the board's own.
 
-Callers get one allowance across every camera on the board: 10 photos an hour and 20 a day each, the sysop exempt.
+Callers get one allowance across every camera on the board: 10 photos an hour and 20 a day each as shipped (CONFIG photos sets it), the sysop exempt.
+
+The board keeps Photos in bounds for every camera, a satellite's included: CONFIG photos' days, count and card floor, applied in the background after pictures are filed. A satellite's `motion/` pictures are kept by the timelapse's limits. While the card is under its floor a satellite takes no picture, as the built-in camera does.
 
 This needs µnleashed BBS 1.2.0 or later, which carries the link and the camera list. A satellite on this firmware still works with a board from before sharing: that board is its only one, and gets every picture.
 
