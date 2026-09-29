@@ -61,6 +61,7 @@
 // ===========================================================================
 #include <atomic>
 #include <cctype>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -71,19 +72,23 @@
 #include "config.h"
 #include "core/bbs.h"
 #include "core/claims.h"
+#include <sys/stat.h>
+
 #include "core/clock.h"
+#include "core/disk.h"
 #include "core/fx.h"
 #include "core/linkfam.h"
 #include "core/photos.h"
 #include "core/plugin.h"
 #include "core/runner.h"
+#include "core/satwords.h"
 #include "core/sysconfig.h"
 #include "platform/platform.h"
 #include "plugins/camera_rules.h"
 #include "plugins/files.h"
 #include "plugins/link.h"
 
-UNLEASHED_PLUGIN_API(1, 2);
+UNLEASHED_PLUGIN_API(1, 3);
 
 using namespace linkfam;
 
@@ -204,6 +209,7 @@ struct Sat {
     uint8_t  peer = 0;
     bool     listed = false;
     bool     known = false;
+    bool     refused = false;                // the camera list was full: said once
     char     sensor[12] = {};
     uint32_t heap = 0, psram = 0, uptime = 0;
     uint8_t  lastErr = 0;
@@ -253,6 +259,12 @@ Offer* g_offer = nullptr;
 // ---------------------------------------------------------------------------
 enum : uint8_t { J_IDLE, J_ASKED, J_COMING, J_DONE };
 enum : uint8_t { K_CALLER, K_SYSTEM };
+// Why a picture did not come, for the caller's one line (satwords kSnap*).
+enum : uint8_t { W_NONE, W_NOANSWER, W_SLOW, W_DAMAGED, W_NOPIC, W_FULL, W_BUSY, W_OTHER, W_STOPPED };
+// A caller waiting for the one picture ahead (1.2.0-link.17): by node and
+// call serial, never a Session*, since sessions are a pool.
+struct Waiter { uint8_t node; uint8_t peer; uint16_t call; };
+constexpr uint8_t kLine = 4;
 struct Job {
     std::atomic<uint8_t> ph{ J_IDLE };
     uint8_t  kind = K_CALLER;
@@ -276,8 +288,26 @@ struct Job {
     uint16_t pw = 0, ph2 = 0;
     std::atomic<bool> filed{ false };
     char     err[72] = {};                   // the loop's reason
-    uint8_t  busyAt = 0;                     // SNAP_FAIL busy: 0 none, 1 + the requests ahead, 0xFF full
+    uint8_t  why = W_NONE;                   // the loop's, as a W_*
     char     rerr[72] = {};                  // the runner's (bulkData, bulkFinish)
+    uint8_t  rwhy = W_NONE;                  // the runner's, as a W_*
+    // A sat busy with other boards' pictures: the SNAP goes again at retryAt
+    // (sess 0 meanwhile), and ahead is what the caller was last told.
+    uint32_t retryAt = 0;
+    uint8_t  retries = 0;
+    uint8_t  ahead = 0;
+    // The camera number when the picture was asked for: the line and the log
+    // keep it though the sat is renumbered or forgotten meanwhile (review).
+    uint8_t  no = 0;
+    // A caller's snapshot is counted when the picture is filed, not when it
+    // is asked for, so a busy, full or silent sat costs nothing (review).
+    bool     spend = false;
+    uint32_t spendAt = 0;
+    // The callers waiting their turn, oldest first, and their spinner's clock.
+    Waiter   line[kLine] = {};
+    uint8_t  lineN = 0;
+    uint32_t lineSpinAt = 0;
+    uint8_t  lineSpin = 0;
     // The part-file is the runner's while it is inside bulkData or
     // bulkFinish, and the loop's otherwise: wbusy is who holds it now. dead
     // tells the runner the loop has given the picture up, so it closes the
@@ -361,6 +391,135 @@ Session* waiter() {
 void say(Session& s, Color c, const char* text) {
     s.term.color(s.tl, c);
     s.term.text(s.tl, text);
+}
+
+// arrow: the board's voice, "--> text", with no newline (the prompt that
+// follows draws its own).
+void arrow(Session& s, Color c, const char* text) {
+    s.term.color(s.tl, Color::Cyan);
+    s.term.text(s.tl, "--> ");
+    say(s, c, text);
+}
+
+// camNo: a sat's camera number, the one SNAPSHOT takes (2 to 9), 0 unlisted.
+uint8_t camNo(uint8_t peer) {
+    if (!g_sat || peer >= ulink::Engine::kPeers || !g_sat[peer].listed) return 0;
+    return photos::numberOf(&g_sat[peer].cam);
+}
+
+// camLine: one of satwords' kSnap* lines for camera number no: "Camera sat"
+// when it fits width with its arrow and extra (the spinner), else "Sat",
+// and cut to fit when even that does not (kSnapOther's reason).
+void camLine(char* out, size_t n, uint8_t width, uint8_t extra, const char* fmt, uint8_t no, unsigned a = 0,
+             const char* why = nullptr) {
+    for (int pass = 0; pass < 2; ++pass) {
+        const char* who = pass ? satwords::kCamSatShort : satwords::kCamSat;
+        if (why) snprintf(out, n, fmt, who, static_cast<unsigned>(no), why);
+        else     snprintf(out, n, fmt, who, static_cast<unsigned>(no), a);
+        if (4u + strlen(out) + extra <= width) return;
+    }
+    const size_t keep = width > 4u + extra ? width - 4u - extra : 0;
+    if (keep < n) out[keep] = '\0';
+}
+
+// ---------------------------------------------------------------------------
+// Each sat's own log on the card (1.2.0-link.17): camsat-<n>-errors.log in
+// the Logs area, beside the caller log's mirror, written on the runner. One
+// line a failure (and the other sat lines): when, the sat, what happened,
+// and who asked. 64 KB, then it becomes camsat-<n>-errors.old and a new one
+// starts. No card: the console only.
+// ---------------------------------------------------------------------------
+constexpr uint32_t kLogMax = 64u * 1024u;
+constexpr uint8_t  kLogQ   = 6;
+struct LogLine { uint8_t no; char text[176]; };   // room for every field whole, so the newline is never cut
+struct LogJob : runner::Job {
+    LogLine  q[kLogQ];
+    uint8_t  head = 0, count = 0;            // under plat::runLock
+    uint32_t dropped = 0;
+};
+LogJob* g_log = nullptr;                    // the heap, from the first start
+
+void logWrite(const LogLine& l) {
+    const char* base = plat::sdBase();
+    if (!base[0]) return;
+    char dir[96], path[128], old[128];
+    snprintf(dir, sizeof(dir), "%s/%s", base, BBS_SD_LOG_DIR);
+    mkdir(dir, 0755);                        // harmless when it is there
+    snprintf(path, sizeof(path), "%s/camsat-%u-errors.log", dir, static_cast<unsigned>(l.no));
+    struct stat st;
+    if (stat(path, &st) == 0 && static_cast<uint32_t>(st.st_size) + strlen(l.text) > kLogMax) {
+        snprintf(old, sizeof(old), "%s/camsat-%u-errors.old", dir, static_cast<unsigned>(l.no));
+        // FAT refuses to rename over a file, so the older one goes first;
+        // it is the one being replaced, never the live log.
+        remove(old);
+        rename(path, old);
+    }
+    FILE* f = disk::open(path, "a");
+    if (!f) return;
+    fputs(l.text, f);
+    fclose(f);
+}
+
+void logWork(runner::Job& self) {
+    LogJob& j = static_cast<LogJob&>(self);
+    for (;;) {
+        LogLine l;
+        plat::runLock();
+        if (!j.count) { plat::runUnlock(); break; }
+        l = j.q[j.head];
+        j.head = static_cast<uint8_t>((j.head + 1) % kLogQ);
+        --j.count;
+        plat::runUnlock();
+        logWrite(l);
+        runner::breathe();
+    }
+}
+
+// logKick (loop): the job to the runner while lines wait and it is not out.
+void logKick() {
+    if (!g_log) return;
+    if (runner::done(*g_log)) runner::collect(*g_log);
+    if (!runner::idle(*g_log)) return;
+    plat::runLock();
+    const bool any = g_log->count != 0;
+    plat::runUnlock();
+    if (!any) return;
+    g_log->work = logWork;
+    g_log->name = "camsat log";
+    runner::post(*g_log);                   // refused: tick tries again
+}
+
+// satLog (loop): a line about sat peer, to the console and to its log on
+// the card. who: the caller's handle, "timelapse" or "motion", or null.
+void satLog(uint8_t peer, uint8_t no, const char* who, const char* fmt, ...) __attribute__((format(printf, 4, 5)));
+// no: the camera number, 0 for the one it has now.
+void satLog(uint8_t peer, uint8_t no, const char* who, const char* fmt, ...) {
+    char what[100];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(what, sizeof(what), fmt, ap);
+    va_end(ap);
+    const char* name = g_sat && peer < ulink::Engine::kPeers && g_sat[peer].name[0] ? g_sat[peer].name
+                                                                                   : linkp::peerName(peer);
+    if (!no) no = camNo(peer);
+    plat::log("camsat: sat %u \"%s\": %s%s%s", static_cast<unsigned>(no), name ? name : "", what, who ? ", for " : "",
+              who ? who : "");
+    if (!g_log || !plat::sdBase()[0]) return;
+    char when[24] = "unknown time";
+    if (clk::valid()) clk::fmtEpoch(when, sizeof(when), "%Y-%m-%d %H:%M:%S", clk::epoch());
+    LogLine l;
+    l.no = no;
+    snprintf(l.text, sizeof(l.text), "%.19s\tsat %u %.16s\t%.99s\t%.24s\n", when, static_cast<unsigned>(no), name ? name : "",
+             what, who ? who : "-");
+    plat::runLock();
+    const bool room = g_log->count < kLogQ;
+    if (room) {
+        g_log->q[(g_log->head + g_log->count) % kLogQ] = l;
+        ++g_log->count;
+    }
+    plat::runUnlock();
+    if (!room && g_log->dropped++ % 16 == 0) plat::log("camsat: a sat log line was dropped: the queue was full");
+    logKick();
 }
 
 bool localNow(struct tm& t) {
@@ -483,7 +642,7 @@ void bulkFinish(uint8_t, uint16_t sess, bool ok) {
         j.writerOpen = false;
         if (!ok || j.dead.load()) {
             photos::abandon(j.w);
-            if (!ok) snprintf(j.rerr, sizeof(j.rerr), "the picture came damaged");
+            if (!ok) { snprintf(j.rerr, sizeof(j.rerr), "the picture came damaged"); j.rwhy = W_DAMAGED; }
         } else {
             j.pw = get16(j.head + 4);
             j.ph2 = get16(j.head + 6);
@@ -531,13 +690,18 @@ void finish(bool ok) {
         snprintf(g_last, sizeof(g_last), "%.111s", j.rel);
         snprintf(g_lastBy, sizeof(g_lastBy), "%.21s", j.kind == K_CALLER ? j.handle : "the board");
         if (j.peer < ulink::Engine::kPeers) { g_sat[j.peer].pictures++; g_sat[j.peer].lastAt = clk::epoch(); }
-        plat::log("camsat: %s %ux%u %u bytes from \"%s\" in %u ms", j.rel, static_cast<unsigned>(j.pw),
-                  static_cast<unsigned>(j.ph2), static_cast<unsigned>(j.bytes), linkp::peerName(j.peer),
-                  static_cast<unsigned>(plat::millis() - j.startedAt));
+        satLog(j.peer, j.no, j.handle, "%.60s %ux%u, %u bytes in %u ms", j.rel, static_cast<unsigned>(j.pw),
+               static_cast<unsigned>(j.ph2), static_cast<unsigned>(j.bytes),
+               static_cast<unsigned>(plat::millis() - j.startedAt));
     } else {
-        plat::log("camsat: %s failed: %s", j.rel[0] ? j.rel : "a picture", why[0] ? why : "no reason given");
+        // Its own log names the sat, so the line is the reason alone.
+        satLog(j.peer, j.no, j.handle, "%s", why[0] ? why : "no reason given");
     }
     Session* s = waiter();
+    // The caller's snapshot counts now that it is filed (a caller who hung up
+    // meanwhile is not charged for it: there is nobody to charge).
+    if (ok && j.kind == K_CALLER && j.spend && s) photos::spend(*s, j.spendAt);
+    j.spend = false;
     const uint8_t kind = j.kind, node = j.node;
     j.node = 0xFF;
     j.waiting = false;
@@ -551,48 +715,43 @@ void finish(bool ok) {
     s->term.cursor(s->tl, true);
     s->term.nl(s->tl);
     char buf[160];
-    const uint8_t busyAt = j.busyAt;
-    j.busyAt = 0;
-    if (!ok && busyAt) {
-        const char* nm = j.peer < ulink::Engine::kPeers ? g_sat[j.peer].name : "satellite";
-        const bool wide = b.rowWidth(*s) >= 60;
-        if (busyAt == 0xFF)
-            snprintf(buf, sizeof(buf), wide ? "The %s camera is busy and its queue is full. Try again in a moment."
-                                            : "The %s camera's queue is full.\n    Try again in a moment.", nm);
-        else if (busyAt == 1)
-            snprintf(buf, sizeof(buf), wide ? "The %s camera is busy. Try again in a moment."
-                                            : "The %s camera is busy.\n    Try again in a moment.", nm);
-        else
-            snprintf(buf, sizeof(buf), wide ? "The %s camera is busy, %u ahead of you. Try again in a moment."
-                                            : "The %s camera is busy,\n    %u ahead of you: try in a moment.",
-                     nm, static_cast<unsigned>(busyAt - 1));
-        // Two lines at 40, each whole (a wrap would break "2 ahead / of you").
-        char* nl = strchr(buf, '\n');
-        if (nl) *nl = '\0';
-        // The board's voice, "--> ", as the built-in camera's "in use" line.
-        s->term.color(s->tl, Color::Cyan);
-        s->term.text(s->tl, "--> ");
-        say(*s, Color::Yellow, buf);
-        if (nl) { s->term.nl(s->tl); say(*s, Color::Yellow, nl + 1); }
-        b.release(*s);
-        return;
-    }
     if (!ok) {
-        snprintf(buf, sizeof(buf), "No photo: %.71s.", why[0] ? why : "the satellite gave none");
-        say(*s, Color::LightRed, buf);
+        // One line: the camera by its number and what went wrong (Rob,
+        // 1.2.0). A busy or full sat is a wait, not a fault: yellow.
+        const uint8_t code = j.why != W_NONE ? j.why : j.rwhy != W_NONE ? j.rwhy : static_cast<uint8_t>(W_OTHER);
+        const char* fmt = code == W_NOANSWER ? satwords::kSnapNoAnswer
+                        : code == W_SLOW     ? satwords::kSnapSlow
+                        : code == W_DAMAGED  ? satwords::kSnapDamaged
+                        : code == W_NOPIC    ? satwords::kSnapNoPic
+                        : code == W_FULL     ? satwords::kSnapFull
+                        : code == W_BUSY     ? satwords::kSnapBusy
+                                             : satwords::kSnapOther;
+        if (code == W_STOPPED) snprintf(buf, sizeof(buf), "%s", satwords::kWhyStopped);
+        else camLine(buf, sizeof(buf), b.rowWidth(*s), 0, fmt, j.no, 0,
+                     code == W_OTHER ? (why[0] ? why : "no picture came") : nullptr);
+        arrow(*s, code == W_FULL || code == W_BUSY ? Color::Yellow : code == W_STOPPED ? Color::Grey : Color::LightRed,
+              buf);
         b.release(*s);
         return;
     }
     snprintf(buf, sizeof(buf), "Photo saved: %.111s (FILES, area 12)", j.rel);
+    // At 40 the area goes on a line of its own, so the name is never cut.
+    if (strlen(buf) > b.rowWidth(*s)) snprintf(buf, sizeof(buf), "Photo saved: %.111s", j.rel);
     say(*s, Color::LightGreen, buf);
     s->term.nl(s->tl);
+    if (!strstr(buf, "area 12")) {
+        say(*s, Color::Grey, "It is in FILES, area 12.");
+        s->term.nl(s->tl);
+    }
     const uint8_t fi = plugins::indexOf("files");
     const bool filesOn = fi != 0xFF && plugins::running(fi);
     const camrules::Offer o = camrules::offerFor(true, true, filesOn && plugins::mayUse(*s, g_set.photos),
                                                  claims::held(claims::Res::Transfer));
     if (o == camrules::Offer::Ask && g_offer && s->id < kSlots) {
         snprintf(g_offer[s->id].rel, sizeof(g_offer[0].rel), "%.111s", j.rel);
-        say(*s, Color::Cyan, "Download it now?  [Y]es  [X]modem  [N]o ");
+        // 40 wide with its space, which wraps a 40-column screen (review).
+        say(*s, Color::Cyan, b.rowWidth(*s) < 48 ? "Download it now? [Y]es [X]modem [N]o "
+                                                  : "Download it now?  [Y]es  [X]modem  [N]o ");
         s->term.color(s->tl, Color::White);
         s->ownerData = 1;
         return;
@@ -609,12 +768,14 @@ void bulkEnd(uint8_t peer, uint16_t sess, bool) {
     finish(j.filed.load());
 }
 
-void failWith(const char* why) {
+void failWith(uint8_t code, const char* why) {
+    job().why = code;
     snprintf(job().err, sizeof(job().err), "%s", why);
     finish(false);
 }
 
 bool message(uint8_t peer, uint16_t sess, uint8_t type, const uint8_t* p, size_t n);
+void busyWait(uint8_t ahead);
 void reconcile();
 
 // startSystem: a picture the board takes for itself (timelapse, motion),
@@ -647,6 +808,12 @@ bool startSystem(int peer, uint16_t sess, uint8_t reason) {
     j.waiting = false;
     j.err[0] = '\0';
     j.rerr[0] = '\0';
+    j.why = W_NONE;
+    j.rwhy = W_NONE;
+    j.retries = 0;
+    j.ahead = 0;
+    j.no = camNo(static_cast<uint8_t>(peer));
+    j.spend = false;
     j.filed.store(false);
     snprintf(j.handle, sizeof(j.handle), "%s", folder);
     j.startedAt = plat::millis();
@@ -675,9 +842,16 @@ bool message(uint8_t peer, uint16_t sess, uint8_t type, const uint8_t* p, size_t
                 static const char* const kWhy[] = { "the satellite failed", "the satellite has no camera",
                                                     "the satellite is out of memory", "the satellite is busy",
                                                     "the satellite's flash failed", "the satellite's camera gave no picture" };
-                // Busy (1.2.0): the requests ahead in its queue, or full.
-                if (p[2] == CE_BUSY) job().busyAt = n >= 4 ? (p[3] == kQueueFull ? 0xFF : static_cast<uint8_t>(p[3] + 1)) : 1;
-                failWith(kWhy[p[2] < 6 ? p[2] : 0]);
+                // Busy with other boards' pictures (1.2.0): a caller waits,
+                // told how many are ahead, and the board asks again.
+                if (p[2] == CE_BUSY && !(n >= 4 && p[3] == kQueueFull) && job().kind == K_CALLER) {
+                    busyWait(n >= 4 ? p[3] : 1);
+                    return true;
+                }
+                // Its queue is full, or it has failed.
+                const uint8_t code = p[2] == CE_BUSY ? (n >= 4 && p[3] == kQueueFull ? W_FULL : W_BUSY)
+                                   : p[2] == CE_CAPTURE ? W_NOPIC : W_OTHER;
+                failWith(code, code == W_FULL ? "the satellite's queue is full" : kWhy[p[2] < 6 ? p[2] : 0]);
             }
             return true;
         case CAM_EVENT: {
@@ -715,14 +889,16 @@ void reset(uint8_t peer, uint16_t sess, uint8_t reason) {
     if (peer != job().peer || sess != job().sess || !busy() || job().dying) return;
     char why[48];
     snprintf(why, sizeof(why), "the link to the satellite dropped (%u)", static_cast<unsigned>(reason));
-    failWith(why);
+    // Before any of the picture came, it did not answer; part way, it is
+    // said as it happened.
+    failWith(job().ph.load() == J_ASKED ? W_NOANSWER : W_OTHER, why);
 }
 
 void peerState(uint8_t peer, bool up) {
     ulink::Engine* e = linkp::engine();
     if (!e || e->peerKind(peer) != ulink::KIND_CAMSAT) return;
     if (up && g_running) sendSettings(peer);
-    if (!up && busy() && job().peer == peer && job().ph.load() == J_ASKED) failWith("the satellite went quiet");
+    if (!up && busy() && job().peer == peer && job().ph.load() == J_ASKED) failWith(W_NOANSWER, "the satellite went quiet");
 }
 
 const linkp::Family kFamily = [] {
@@ -749,11 +925,63 @@ const linkp::Family kFamily = [] {
 // ---------------------------------------------------------------------------
 // tick: every 20 ms (PF_FAST). The spinner, the timeouts, the timelapse.
 // ---------------------------------------------------------------------------
+bool lineNext(uint32_t now);
+void lineSpin(uint32_t now);
+
+// busyWait (loop): the sat has other boards' pictures ahead of this one.
+// Its session goes (the sat has let it go), the caller is told how many are
+// ahead with the spinner, and tick asks again in 2 s, within the 60 s a
+// picture has to start.
+void busyWait(uint8_t ahead) {
+    Job& j = job();
+    if (ulink::Engine* e = linkp::engine()) {
+        if (g_closing.on) e->closeAfter(g_closing.peer, g_closing.sess);
+        g_closing = Closing{ true, j.peer, j.sess, plat::millis() + 3000 };
+    }
+    j.sess = 0;
+    j.retryAt = plat::millis() + 2000;
+    if (j.retries < 0xFF) ++j.retries;
+    if (ahead == j.ahead) return;              // said already
+    j.ahead = ahead;
+    satLog(j.peer, j.no, j.handle, "busy, %u ahead: asking again", static_cast<unsigned>(ahead));
+    Session* s = waiter();
+    if (!s) return;
+    char buf[96];
+    s->term.left(s->tl, 1);
+    s->term.text(s->tl, " ");
+    s->term.nl(s->tl);
+    camLine(buf, sizeof(buf), Bbs::instance().rowWidth(*s), 2, satwords::kSnapWait, j.no, ahead);
+    arrow(*s, Color::Yellow, buf);
+    s->term.text(s->tl, " ");
+    s->term.color(s->tl, Color::Yellow);
+    fx::spinFrame(s->term, s->tl, fx::Spin::Line, j.spin);
+}
+
+// retrySnap (tick): the SNAP again, on a session of its own.
+void retrySnap(uint32_t now) {
+    Job& j = job();
+    ulink::Engine* e = linkp::engine();
+    struct tm t;
+    j.retryAt = now + 2000;
+    if (!e || !localNow(t)) return;
+    const uint16_t sess = e->openSession(j.peer, ulink::FAM_CAMERA);
+    if (!sess) return;
+    uint8_t m[ulink::kPayloadMax];
+    const size_t len = snapMsg(m, sizeof(m), j.req, CR_CALLER, t, j.handle);
+    if (e->send(j.peer, sess, ulink::FAM_CAMERA, CAM_SNAP, m, len) != 1) {
+        e->closeSession(j.peer, sess);
+        return;
+    }
+    j.sess = sess;
+}
+
 void tick(uint32_t now) {
     static uint32_t listedAt = 0;
     if (static_cast<int32_t>(now - listedAt) >= 1000) { listedAt = now; reconcile(); }
     Job& j = job();
     if (runner::done(j.closer)) runner::collect(j.closer);   // a given-up part-file is gone
+    logKick();                                               // sat log lines the runner did not take
+    lineSpin(now);
     if (g_closing.on && static_cast<int32_t>(now - g_closing.at) >= 0) {
         if (ulink::Engine* e = linkp::engine()) e->closeAfter(g_closing.peer, g_closing.sess);
         g_closing.on = false;
@@ -761,6 +989,8 @@ void tick(uint32_t now) {
     // A finish the runner held off: again.
     if (j.dying) { finish(j.dyingOk); return; }
     const uint8_t ph = j.ph.load();
+    // The line first: a caller waiting beats the timelapse to the air.
+    if (ph == J_IDLE && !busy() && lineNext(now)) return;
     if (ph == J_IDLE) {
         const uint32_t every = tlEvery();
         struct tm t;
@@ -780,11 +1010,20 @@ void tick(uint32_t now) {
     const int32_t age = static_cast<int32_t>(now - j.startedAt);
     // 60 s: a satellite shared by several boards (1.2.0) queues a SNAP
     // behind the other boards' pictures, a few seconds each.
-    if (ph == J_ASKED && age > 60000) { failWith("the satellite did not answer"); return; }
+    if (ph == J_ASKED && age > 60000) {
+        // A sat that kept saying busy was there, just full of others' pictures.
+        if (j.retries) failWith(W_BUSY, "the satellite stayed busy");
+        else           failWith(W_NOANSWER, "the satellite did not answer");
+        return;
+    }
+    // Nobody waiting for a picture a busy sat has not started: the air goes
+    // to the line rather than to two more minutes of asking (review).
+    if (ph == J_ASKED && !j.sess && j.kind == K_CALLER && !j.waiting) { failWith(W_OTHER, "the caller left"); return; }
+    if (ph == J_ASKED && !j.sess && static_cast<int32_t>(now - j.retryAt) >= 0) retrySnap(now);
     if (ph == J_COMING && age > 120000) {
         const uint8_t peer = j.peer;
         const uint16_t sess = j.sess;
-        failWith("the picture took too long to come");   // first: the reset below then finds it ended
+        failWith(W_SLOW, "the picture took too long to come");   // first: the reset below then finds it ended
         if (ulink::Engine* e = linkp::engine()) e->resetSession(peer, sess, ulink::R_CLOSED);
         return;
     }
@@ -803,7 +1042,94 @@ void tick(uint32_t now) {
 // ---------------------------------------------------------------------------
 void refuse(Bbs& b, Session& s, const char* why) {
     say(s, Color::LightRed, why);
-    b.prompt(s);
+    if (b.owns(s, g_index)) b.release(s);   // a caller from the line: release draws the prompt
+    else                    b.prompt(s);
+}
+
+// joinLine: the one picture on the air is somebody else's, so the caller
+// waits their turn with the spinner (Rob, 1.2.0), and tick starts theirs
+// when it is done. A key leaves the line.
+void joinLine(Bbs& b, Session& s, int peer, uint32_t now) {
+    Job& j = job();
+    char buf[96];
+    const uint8_t no = camNo(static_cast<uint8_t>(peer));
+    // The same sat on the air: Rob's line. Another: the wait is this board's.
+    const bool same = j.ph.load() != J_IDLE && j.peer == peer;
+    if (j.lineN >= kLine || !b.own(s, g_index)) {
+        camLine(buf, sizeof(buf), b.rowWidth(s), 0, satwords::kSnapHereFull, 0);
+        arrow(s, Color::Yellow, buf);
+        if (b.owns(s, g_index)) b.release(s);
+        else                    b.prompt(s);
+        return;
+    }
+    b.setDoing(s, "SNAPSHOT");
+    s.ownerData = 2;
+    j.line[j.lineN++] = Waiter{ s.id, static_cast<uint8_t>(peer), s.call };
+    if (same) camLine(buf, sizeof(buf), b.rowWidth(s), 2, satwords::kSnapWait, no, j.lineN);
+    else      camLine(buf, sizeof(buf), b.rowWidth(s), 2, satwords::kSnapWaitHere, j.lineN);
+    arrow(s, Color::Yellow, buf);
+    s.term.text(s.tl, " ");
+    s.term.cursor(s.tl, false);
+    fx::spinFrame(s.term, s.tl, fx::Spin::Line, 0);
+    if (j.lineN == 1) j.lineSpinAt = now + 150;
+}
+
+// leaveLine: node's place given up (a key, a hang-up); those behind move up.
+void leaveLine(uint8_t node) {
+    Job& j = job();
+    uint8_t k = 0;
+    for (uint8_t i = 0; i < j.lineN; ++i)
+        if (j.line[i].node != node) j.line[k++] = j.line[i];
+    j.lineN = k;
+}
+
+// lineSession: waiter w's session while it is still that call and waiting.
+Session* lineSession(const Waiter& w) {
+    Session* s = nullptr;
+    struct Find { const Waiter* w; Session** out; } f{ &w, &s };
+    Bbs::instance().eachSession([](void* ctx, Session& x) {
+        Find* ff = static_cast<Find*>(ctx);
+        if (x.id == ff->w->node && x.call == ff->w->call && x.loggedIn) *ff->out = &x;
+    }, &f);
+    if (!s || !Bbs::instance().owns(*s, g_index) || s->ownerData != 2) return nullptr;
+    return s;
+}
+
+void snapFrom(Bbs& b, Session& s, int peer, uint32_t now);
+
+// lineNext (tick, nothing on the air): the first caller still waiting
+// starts, through every check a fresh SNAPSHOT makes.
+bool lineNext(uint32_t now) {
+    Job& j = job();
+    while (j.lineN) {
+        const Waiter w = j.line[0];
+        leaveLine(w.node);
+        Session* s = lineSession(w);
+        if (!s) continue;
+        s->term.left(s->tl, 1);
+        s->term.text(s->tl, " ");
+        s->term.cursor(s->tl, true);
+        s->term.nl(s->tl);
+        s->ownerData = 0;
+        snapFrom(Bbs::instance(), *s, w.peer, now);
+        return true;
+    }
+    return false;
+}
+
+// lineSpin (tick): the waiting callers' spinners, one clock for all.
+void lineSpin(uint32_t now) {
+    Job& j = job();
+    if (!j.lineN || static_cast<int32_t>(now - j.lineSpinAt) < 0) return;
+    j.lineSpinAt = now + 150;
+    ++j.lineSpin;
+    for (uint8_t i = 0; i < j.lineN; ++i) {
+        Session* s = lineSession(j.line[i]);
+        if (!s || !s->tl.empty()) continue;
+        s->term.left(s->tl, 1);
+        s->term.color(s->tl, Color::Yellow);
+        fx::spinFrame(s->term, s->tl, fx::Spin::Line, j.lineSpin);
+    }
 }
 
 void snapFrom(Bbs& b, Session& s, int peer, uint32_t now) {
@@ -835,7 +1161,7 @@ void snapFrom(Bbs& b, Session& s, int peer, uint32_t now) {
         refuse(b, s, "The card is too full for another photo.");
         return;
     }
-    if (busy()) { refuse(b, s, "The camera is busy. Try again in a moment."); return; }
+    if (busy()) { joinLine(b, s, peer, now); return; }
     struct tm t;
     localNow(t);
     Job& j = job();
@@ -846,23 +1172,32 @@ void snapFrom(Bbs& b, Session& s, int peer, uint32_t now) {
     snprintf(j.handle, sizeof(j.handle), "%s%s", s.guest ? "*" : "", s.user);
     snprintf(j.desc, sizeof(j.desc), "Taken by %.30s", j.handle);
     const uint16_t sess = e->openSession(static_cast<uint8_t>(peer), ulink::FAM_CAMERA);
-    if (!sess) { refuse(b, s, "The camera is busy. Try again in a moment."); return; }
+    char line[96];
+    const uint8_t no = camNo(static_cast<uint8_t>(peer));
+    camLine(line, sizeof(line), b.rowWidth(s), 0, satwords::kSnapBusy, no);
+    if (!sess) { refuse(b, s, line); return; }
     uint8_t m[ulink::kPayloadMax];
     j.req = g_reqNext++;
     const size_t len = snapMsg(m, sizeof(m), j.req, CR_CALLER, t, j.handle);
     if (e->send(static_cast<uint8_t>(peer), sess, ulink::FAM_CAMERA, CAM_SNAP, m, len) != 1) {
         e->closeSession(static_cast<uint8_t>(peer), sess);
-        refuse(b, s, "The camera is busy. Try again in a moment.");
+        refuse(b, s, line);
         return;
     }
-    if (!b.own(s, g_index)) { e->closeSession(static_cast<uint8_t>(peer), sess); b.prompt(s); return; }
+    if (!b.owns(s, g_index) && !b.own(s, g_index)) { e->closeSession(static_cast<uint8_t>(peer), sess); b.prompt(s); return; }
     b.setDoing(s, "SNAPSHOT");
     s.ownerData = 0;
     j.kind = K_CALLER;
     j.peer = static_cast<uint8_t>(peer);
     j.sess = sess;
     j.ours = true;
-    j.busyAt = 0;
+    j.why = W_NONE;
+    j.rwhy = W_NONE;
+    j.retries = 0;
+    j.ahead = 0;
+    j.no = no;
+    j.spend = !sysop;
+    j.spendAt = epoch;
     j.node = s.id;
     j.waiting = true;
     j.err[0] = '\0';
@@ -872,14 +1207,18 @@ void snapFrom(Bbs& b, Session& s, int peer, uint32_t now) {
     j.spinAt = now;
     j.ph.store(J_ASKED);
     if (!sysop) {
-        photos::spend(s, epoch);
         char buf[80];
-        snprintf(buf, sizeof(buf), "Snapshot %u of %u this hour, %u of %u today.",
+        snprintf(buf, sizeof(buf), b.rowWidth(s) < 48 ? "Snapshot %u/%u this hour, %u/%u today." : "Snapshot %u of %u this hour, %u of %u today.",
                  static_cast<unsigned>(v.hour + 1), static_cast<unsigned>(v.perHour),
                  static_cast<unsigned>(v.day + 1), static_cast<unsigned>(v.perDay));
         say(s, Color::Grey, buf);
         s.term.nl(s.tl);
     }
+    // "--> Contacting camera sat #2... /" (Rob, 1.2.0): who is being asked,
+    // with the spinner while it answers.
+    snprintf(line, sizeof(line), satwords::kSnapContact, static_cast<unsigned>(no));
+    arrow(s, Color::Yellow, line);
+    s.term.text(s.tl, " ");
     s.term.cursor(s.tl, false);
     s.term.color(s.tl, Color::Yellow);
     fx::spinFrame(s.term, s.tl, fx::Spin::Line, 0);
@@ -888,6 +1227,29 @@ void snapFrom(Bbs& b, Session& s, int peer, uint32_t now) {
 // onKey: the download question, and nothing else.
 void onKey(Session& s, int k, uint32_t now) {
     Bbs& b = Bbs::instance();
+    if (s.ownerData == 2) {                      // waiting in line: a key leaves it
+        leaveLine(s.id);
+        s.ownerData = 0;
+        s.term.left(s.tl, 1);
+        s.term.text(s.tl, " ");
+        s.term.cursor(s.tl, true);
+        s.term.nl(s.tl);
+        arrow(s, Color::Grey, satwords::kWhyStopped);
+        b.release(s);
+        return;
+    }
+    // Being asked for, not yet coming: a key stops it, as it leaves the line
+    // (review: the busy line looked the same and held every key a minute).
+    if (s.ownerData == 0 && g_jobp && job().node == s.id && job().waiting && job().kind == K_CALLER &&
+        job().ph.load() == J_ASKED) {
+        Job& j = job();
+        const uint8_t peer = j.peer;
+        const uint16_t sess = j.sess;
+        failWith(W_STOPPED, "the caller stopped it");      // first: the reset below then finds it ended
+        if (sess)
+            if (ulink::Engine* e = linkp::engine()) e->resetSession(peer, sess, ulink::R_CLOSED);
+        return;
+    }
     if (s.ownerData != 1) return;
     s.ownerData = 0;
     s.term.cursor(s.tl, true);
@@ -905,6 +1267,7 @@ void onKey(Session& s, int k, uint32_t now) {
 
 void onLogoff(Session& s) {
     if (g_jobp && g_jobp->node == s.id) g_jobp->waiting = false;       // the photo is still filed and counted
+    if (g_jobp) leaveLine(s.id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,7 +1397,10 @@ void reconcile() {
             x.cam.levels = satLevels;
             x.cam.facts = satFacts;
             x.listed = photos::addCamera(x.cam);
-            if (!x.listed) plat::log("camsat: the board's camera list is full; \"%s\" is not in it", x.name);
+            // Once, not every second: reconcile runs a second at a time,
+            // and each line is a card write (review).
+            if (!x.listed && !x.refused) satLog(p, 0, nullptr, "the board's camera list is full, so it is not in it");
+            x.refused = !x.listed;
         }
     }
     bool any = false;
@@ -1134,11 +1500,14 @@ bool start(Bbs&) {
     if (!g_jobp) {                                         // once, and kept: a CONFIG save restarts plugins
         g_jobp = new (std::nothrow) Job();
         g_sat = new (std::nothrow) Sat[ulink::Engine::kPeers]();
-        if (!g_jobp || !g_sat) {
+        g_log = new (std::nothrow) LogJob();
+        if (!g_jobp || !g_sat || !g_log) {
             delete g_jobp;
             delete[] g_sat;
+            delete g_log;
             g_jobp = nullptr;
             g_sat = nullptr;
+            g_log = nullptr;
             plat::log("camsat: not enough memory to start");
             return false;
         }
@@ -1163,8 +1532,11 @@ bool start(Bbs&) {
 
 void stop() {
     g_running = false;
+    // A picture in flight, not only a closer still out (review), and before
+    // the cameras go, so the line still names its camera.
+    if (g_jobp && g_jobp->ph.load() != J_IDLE) failWith(W_OTHER, "the camera was switched off");
     unlistAll();
-    if (busy()) failWith("the camera was switched off");
+    if (g_jobp) g_jobp->lineN = 0;                         // the core hands those callers back
     photosFollow(false);
     linkp::unregisterFamily(ulink::FAM_CAMERA);
 }
