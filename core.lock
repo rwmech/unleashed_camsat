@@ -10,4 +10,4 @@
 ; Copyright 2026 - Robert Mech
 ; SPDX-License-Identifier: GPL-3.0-or-later
 source = https://github.com/rwmech/unleashed_BBS
-commit = 2b95d597047c6d2201c6559fa7312df91b3f6a26
+commit = cc63c5f9fcb7248ab63aeaecac2c3c3af2d37e5b

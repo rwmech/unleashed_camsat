@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# ===========================================================================
+#  µnleashed camsat: release on a version tag
+#
+#  Push a tag v<CAMSAT_VERSION> and this builds the camera satellite's
+#  firmware with tools/release.py on a fresh checkout and publishes it as a
+#  GitHub Release. The directory's deploy/fetch_release.py (unleashed_site)
+#  fetches the newest release into firmware/satellites/camsat/<version>/,
+#  checks it against SHA256SUMS, and the satellite install page offers it.
+#
+#  Three parts, not the board's five: bootloader.bin, partitions.bin and
+#  firmware.bin (one factory app partition), with version.txt,
+#  THIRD_PARTY_NOTICES.md and SHA256SUMS beside them.
+# ===========================================================================
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write            # to create the release and upload its assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini', 'firmware/src/idf_component.yml') }}
+
+      - name: PlatformIO
+        run: pip install platformio
+
+      - name: Build and check the release
+        run: python3 tools/release.py --tag "${GITHUB_REF_NAME}"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A tag with a suffix (v1.1.0-dev.1) is a pre-release, a plain
+        # vX.Y.Z a full one; the directory serves the camera sat from the
+        # latest full release.
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          kind=""
+          case "${ver}" in *-*) kind="--prerelease" ;; esac
+          gh release create "${GITHUB_REF_NAME}" release/"${ver}"/assets/* ${kind} \
+            --title "µnleashed camsat ${ver}" \
+            --notes "The camera satellite for µnleashed BBS 1.2.0 and later, for an AI-Thinker ESP32-CAM (no SD card needed). Flash it from https://unleashedbbs.com/satellites. Three parts: bootloader.bin at 0x1000, partitions.bin at 0x8000, firmware.bin at 0x10000. version.txt says its version; SHA256SUMS lists every file."
